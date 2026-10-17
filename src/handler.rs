@@ -1,0 +1,338 @@
+use crate::command::{Commands, RespSerializer};
+use crate::store::SharedDb;
+use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+pub struct Handler {
+    db: SharedDb,
+    stream: TcpStream,
+    buffer: Vec<u8>,
+}
+
+impl Handler {
+    pub fn new(db: SharedDb, stream: TcpStream) -> Self {
+        Self {
+            db,
+            stream,
+            buffer: Vec::with_capacity(4096),
+        }
+    }
+
+    pub async fn run(mut self) -> Result<(), std::io::Error> {
+        let mut read_buf = [0u8; 1024];
+
+        loop {
+            let bytes_read = self.stream.read(&mut read_buf).await?;
+            if bytes_read == 0 {
+                return Ok(());
+            }
+
+            self.buffer.extend_from_slice(&read_buf[..bytes_read]);
+
+            while let Some((cmd, consumed)) = Commands::parse(&self.buffer) {
+                let response_bytes = self.execute_command(cmd).await;
+
+                self.stream.write_all(&response_bytes).await?;
+                self.stream.flush().await?;
+
+                self.buffer.drain(..consumed);
+            }
+        }
+    }
+
+    async fn execute_command(&mut self, cmd: Commands) -> Vec<u8> {
+        match cmd {
+            // --- General Key Operations ---
+            Commands::Exists { key } => {
+                let res = self.db.exists(&key).await;
+                RespSerializer::integer(if res { 1 } else { 0 })
+            }
+            Commands::Del { key } => {
+                let count = self.db.del(&key).await;
+                RespSerializer::integer(count as i64)
+            }
+            Commands::Expire { key, seconds } => {
+                let res = self.db.expire(&key, seconds).await;
+                RespSerializer::integer(res as i64)
+            }
+            Commands::Ttl { key } => {
+                let remaining = self.db.ttl(&key).await;
+                RespSerializer::integer(remaining)
+            }
+            Commands::Scan => {
+                let keys = self.db.scan().await;
+                let mut mapped = Vec::new();
+                for k in keys {
+                    mapped.push(RespSerializer::bulk_string(k.as_bytes()));
+                }
+                RespSerializer::array(mapped)
+            }
+            Commands::FlushAll => {
+                self.db.flushall().await;
+                RespSerializer::simple_string("OK")
+            }
+
+            // --- Strings & Numeric Operations ---
+            Commands::Set { key, value } => {
+                self.db.set(key, value).await;
+                self.simple_ok()
+            }
+            Commands::Get { key } => {
+                if let Some(bytes) = self.db.get(&key).await {
+                    RespSerializer::bulk_string(&bytes)
+                } else {
+                    RespSerializer::null_bulk_string()
+                }
+            }
+            Commands::SetNx { key, value } => {
+                let count = self.db.setnx(key, value).await;
+                RespSerializer::integer(count as i64)
+            }
+            Commands::Incr { key } => self.handle_incrby(key, 1).await,
+            Commands::Decr { key } => self.handle_incrby(key, -1).await,
+            Commands::IncrBy { key, amount } => self.handle_incrby(key, amount).await,
+            Commands::DecrBy { key, amount } => self.handle_incrby(key, -amount).await,
+            Commands::MSet { keys, values } => {
+                for (i, key) in keys.into_iter().enumerate() {
+                    if let Some(val) = values.get(i) {
+                        self.db.set(key, val.clone()).await;
+                    }
+                }
+                self.simple_ok()
+            }
+            Commands::MGet { keys } => {
+                let mut items = Vec::new();
+                for key in keys {
+                    if let Some(bytes) = self.db.get(&key).await {
+                        items.push(RespSerializer::bulk_string(&bytes));
+                    } else {
+                        items.push(RespSerializer::null_bulk_string());
+                    }
+                }
+                RespSerializer::array(items)
+            }
+
+            // --- Hashes ---
+            Commands::HSet { key, field, value } => {
+                let res = self.db.hset(key, field, value).await;
+                RespSerializer::integer(res as i64)
+            }
+            Commands::HGet { key, field } => {
+                if let Some(bytes) = self.db.hget(&key, &field).await {
+                    RespSerializer::bulk_string(&bytes)
+                } else {
+                    RespSerializer::null_bulk_string()
+                }
+            }
+            Commands::HGetAll { key } => {
+                if let Some(pairs) = self.db.hgetall(&key).await {
+                    let mut elements = Vec::new();
+                    for (f, v) in pairs {
+                        elements.push(RespSerializer::bulk_string(f.as_bytes()));
+                        elements.push(RespSerializer::bulk_string(&v));
+                    }
+                    RespSerializer::array(elements)
+                } else {
+                    RespSerializer::array(vec![])
+                }
+            }
+            Commands::HDel { key, field } => {
+                let res = self.db.hdel(&key, &field).await;
+                RespSerializer::integer(res as i64)
+            }
+            Commands::HKeys { key } => {
+                if let Some(keys) = self.db.hkeys(&key).await {
+                    let elements = keys
+                        .into_iter()
+                        .map(|k| RespSerializer::bulk_string(k.as_bytes()))
+                        .collect();
+                    RespSerializer::array(elements)
+                } else {
+                    RespSerializer::array(vec![])
+                }
+            }
+
+            // --- Lists ---
+            Commands::LPush { key, value } => {
+                let len = self.db.push_list(key, value, true).await;
+                RespSerializer::integer(len as i64)
+            }
+            Commands::RPush { key, value } => {
+                let len = self.db.push_list(key, value, false).await;
+                RespSerializer::integer(len as i64)
+            }
+            Commands::LPop { key } => self.handle_pop_list(&key, true).await,
+            Commands::RPop { key } => self.handle_pop_list(&key, false).await,
+            Commands::LRange { key, start, end } => {
+                if let Some(slice) = self.db.lrange(&key, start, end).await {
+                    let elements = slice
+                        .into_iter()
+                        .map(|b| RespSerializer::bulk_string(&b))
+                        .collect();
+                    RespSerializer::array(elements)
+                } else {
+                    RespSerializer::array(vec![])
+                }
+            }
+            Commands::LLen { key } => {
+                let len = self.db.llen(&key).await;
+                RespSerializer::integer(len as i64)
+            }
+
+            // --- Sets ---
+            Commands::SAdd { key, value } => {
+                let res = self.db.sadd(key, value).await;
+                RespSerializer::integer(res as i64)
+            }
+            Commands::SRem { key, value } => {
+                let res = self.db.srem(&key, &value).await;
+                RespSerializer::integer(res as i64)
+            }
+            Commands::SMembers { key } => {
+                if let Some(m) = self.db.smembers(&key).await {
+                    let elements = m
+                        .into_iter()
+                        .map(|b| RespSerializer::bulk_string(&b))
+                        .collect();
+                    RespSerializer::array(elements)
+                } else {
+                    RespSerializer::array(vec![])
+                }
+            }
+            Commands::SIsMember { key, value } => {
+                let res = self.db.sismember(&key, &value).await;
+                RespSerializer::integer(res as i64)
+            }
+            Commands::SInter { key1, key2 } => {
+                let matches = self.db.sinter(&key1, &key2).await;
+                let elements = matches
+                    .into_iter()
+                    .map(|b| RespSerializer::bulk_string(&b))
+                    .collect();
+                RespSerializer::array(elements)
+            }
+
+            // --- Sorted Sets (ZSets) ---
+            Commands::ZAdd { key, score, value } => {
+                let res = self.db.zadd(key, score, value).await;
+                RespSerializer::integer(res as i64)
+            }
+            Commands::ZRem { key, value } => {
+                let res = self.db.zrem(&key, &value).await;
+                RespSerializer::integer(res as i64)
+            }
+            Commands::ZRange {
+                key,
+                start,
+                end,
+                with_scores,
+            } => {
+                self.handle_zrange(&key, start, end, with_scores, false)
+                    .await
+            }
+            Commands::ZRevRange {
+                key,
+                start,
+                end,
+                with_scores,
+            } => {
+                self.handle_zrange(&key, start, end, with_scores, true)
+                    .await
+            }
+
+            // --- Realtime Messaging Pub/Sub ---
+            Commands::Publish { channel, message } => {
+                let subscriber_count = self.db.publish(&channel, message).await;
+                RespSerializer::integer(subscriber_count as i64)
+            }
+            Commands::Subscribe { channel } => {
+                // Enter a blocking subscription state loop
+                if let Err(e) = self.handle_subscribe_stream(channel).await {
+                    return RespSerializer::error(&format!("ERP PubSub Stream Failure: {}", e));
+                }
+                vec![]
+            }
+
+            Commands::Unknown(cmd_name) => {
+                RespSerializer::error(&format!("Unknown command: {}", cmd_name))
+            }
+        }
+    }
+
+    fn simple_ok(&self) -> Vec<u8> {
+        RespSerializer::simple_string("OK")
+    }
+
+    async fn handle_incrby(&self, key: String, amount: i64) -> Vec<u8> {
+        match self.db.incrby(key, amount).await {
+            Ok(res) => RespSerializer::integer(res),
+            Err(e) => RespSerializer::error(e),
+        }
+    }
+
+    async fn handle_pop_list(&self, key: &str, front: bool) -> Vec<u8> {
+        if let Some(bytes) = self.db.pop_list(key, front).await {
+            RespSerializer::bulk_string(&bytes)
+        } else {
+            RespSerializer::null_bulk_string()
+        }
+    }
+
+    async fn handle_zrange(
+        &self,
+        key: &str,
+        start: i64,
+        end: i64,
+        with_scores: bool,
+        reverse: bool,
+    ) -> Vec<u8> {
+        if let Some(res) = self.db.zrange(key, start, end, reverse).await {
+            let mut elements = Vec::new();
+            for m in res {
+                elements.push(RespSerializer::bulk_string(&m.value));
+                if with_scores {
+                    elements.push(RespSerializer::bulk_string(m.score.to_string().as_bytes()));
+                }
+            }
+            RespSerializer::array(elements)
+        } else {
+            RespSerializer::array(vec![])
+        }
+    }
+
+    async fn handle_subscribe_stream(&mut self, channel: String) -> Result<(), std::io::Error> {
+        let mut rx = self.db.subscribe(channel.clone()).await;
+        let setup_reply = RespSerializer::array(vec![
+            RespSerializer::bulk_string(b"subscribe"),
+            RespSerializer::bulk_string(channel.as_bytes()),
+            RespSerializer::integer(1),
+        ]);
+        self.stream.write_all(&setup_reply).await?;
+        self.stream.flush().await?;
+
+        loop {
+            tokio::select! {
+                msg_res = rx.recv() => {
+                    match msg_res {
+                        Ok(msg_bytes) => {
+                            let broadcast_packet = RespSerializer::array(vec![RespSerializer::bulk_string(b"message"), RespSerializer::bulk_string(channel.as_bytes()), RespSerializer::bulk_string(&msg_bytes)]);
+                            self.stream.write_all(&broadcast_packet).await?;
+                            self.stream.flush().await?;
+                        }
+
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+                _ = self.stream.readable() => {
+                    let mut probe = [0u8; 1];
+                    if self.stream.try_read(&mut probe).is_ok() && probe[0] == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
