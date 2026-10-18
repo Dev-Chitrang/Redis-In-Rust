@@ -4,17 +4,13 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
+import subprocess
+import pathlib
 
 HOST = "127.0.0.1"
 PORT = 6379
 
-r = redis.Redis(
-    host=HOST,
-    port=PORT,
-    decode_responses=True,
-    protocol=2,
-    socket_timeout=5,
-)
+r = None
 
 failures = []
 warnings = []
@@ -575,7 +571,24 @@ def test_protocol():
 # Main
 # --------------------------------------------------
 
-def run_tests():
+def run_tests(mode):
+    global r, failures, warnings
+
+    failures = []
+    warnings = []
+
+    r = redis.Redis(
+        host=HOST,
+        port=PORT,
+        decode_responses=True,
+        protocol=2,
+        socket_timeout=5,
+    )
+
+    print("\n" + "=" * 60)
+    print(f"RUNNING INTEGRATION TESTS: {mode.upper()} MODE")
+    print("=" * 60)
+
     try:
         test_functional()
         test_concurrency()
@@ -591,7 +604,7 @@ def run_tests():
     finally:
         r.close()
 
-    print("\n=== TEST SUMMARY ===")
+    print(f"\n=== {mode.upper()} MODE TEST SUMMARY ===")
     print(f"Failures: {len(failures)}")
     print(f"Warnings: {len(warnings)}")
 
@@ -602,10 +615,135 @@ def run_tests():
         print(f"WARN: {warning}")
 
     if failures:
-        raise SystemExit(1)
+        print(f"\n{mode.upper()} MODE: FAILED")
+        return False
 
-    print("\nCompleted all test sections.")
+    print(f"\n{mode.upper()} MODE: PASSED")
+    return True
+
+def start_server(mode):
+    project_dir = pathlib.Path(__file__).resolve().parent
+
+    # Build the Rust server.
+    subprocess.run(
+        ["cargo", "build"],
+        cwd=project_dir,
+        check=True,
+    )
+
+    # Locate the compiled executable on Windows or Linux.
+    executable_name = (
+        "redis-clone.exe"
+        if __import__("os").name == "nt"
+        else "redis-clone"
+    )
+
+    executable = project_dir / "target" / "debug" / executable_name
+
+    if not executable.exists():
+        raise FileNotFoundError(
+            f"Server executable not found: {executable}"
+        )
+
+    # Launch the server in the requested execution mode.
+    process = subprocess.Popen(
+        [
+            str(executable),
+            "--host", HOST,
+            "--port", str(PORT),
+            "--mode", mode,
+        ],
+        cwd=project_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+
+    # Wait until the server responds to PING.
+    deadline = time.monotonic() + 15
+
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Server exited unexpectedly in {mode} mode. "
+                "Check whether the port is already occupied."
+            )
+
+        try:
+            client = redis.Redis(
+                host=HOST,
+                port=PORT,
+                decode_responses=True,
+                protocol=2,
+                socket_connect_timeout=1,
+                socket_timeout=1,
+            )
+
+            try:
+                if client.ping():
+                    print(f"[INFO] Server ready in {mode} mode")
+                    return process
+            finally:
+                client.close()
+
+        except redis.exceptions.RedisError:
+            time.sleep(0.25)
+
+    process.terminate()
+    process.wait(timeout=5)
+
+    raise TimeoutError(
+        f"Server did not become ready in {mode} mode."
+    )
+
+
+def stop_server(process):
+    if process.poll() is not None:
+        return
+
+    process.terminate()
+
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 if __name__ == "__main__":
-    run_tests()
+    results = {}
+
+    for mode in ("single", "multi"):
+        process = None
+
+        try:
+            print(f"\nStarting server in {mode.upper()} mode...")
+
+            process = start_server(mode)
+            results[mode] = run_tests(mode)
+
+        except Exception as exc:
+            results[mode] = False
+            print(f"\n[ERROR] {mode.upper()} MODE: {exc}")
+            traceback.print_exc()
+
+        finally:
+            if process is not None:
+                stop_server(process)
+
+                print(
+                    f"[INFO] Server stopped after "
+                    f"{mode.upper()} mode tests."
+                )
+
+    print("\n" + "=" * 60)
+    print("FINAL RESULTS")
+    print("=" * 60)
+
+    for mode, passed in results.items():
+        status = "PASSED" if passed else "FAILED"
+        print(f"{mode.upper()} MODE: {status}")
+
+    if not all(results.values()):
+        raise SystemExit(1)
+
+    print("\nAll tests passed in both execution modes!")

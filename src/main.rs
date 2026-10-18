@@ -3,25 +3,99 @@ pub mod handler;
 pub mod server;
 pub mod store;
 
-use crate::server::Server;
+use crate::server::{ExecutionMode, Server};
 use crate::store::SharedDb;
 
-#[tokio::main]
-async fn main() -> Result<(), std::io::Error> {
-    // 1. Instantiate the singular thread-safe cluster storage database master record
-    let db = SharedDb::new();
+use std::env;
+use std::error::Error;
+use tokio::runtime::Builder;
 
-    // 2. Bind network server process loop structures to standard localhost line
-    let server_address = "127.0.0.1:6379";
-    let app_server = Server::new(server_address, db).await?;
+struct Config {
+    host: String,
+    port: u16,
+    mode: ExecutionMode,
+}
 
-    println!(
-        "Redis Clone active! Local host connection port: {}",
-        server_address
-    );
+impl Config {
+    fn from_args() -> Result<Self, String> {
+        let mut host = "127.0.0.1".to_string();
+        let mut port = 6379_u16;
+        let mut mode = ExecutionMode::Multi;
 
-    // 3. Launch processing loop execution state lifetimes
-    app_server.run().await?;
+        let mut args = env::args().skip(1);
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--host" => {
+                    host = args.next().ok_or("--host requires a value")?;
+                }
+
+                "--port" => {
+                    let value = args.next().ok_or("--port requires a value")?;
+
+                    port = value
+                        .parse::<u16>()
+                        .map_err(|_| "Invalid port. Expected 0-65535")?;
+                }
+
+                "--mode" => {
+                    let value = args.next().ok_or("--mode requires single or multi")?;
+
+                    mode = match value.to_lowercase().as_str() {
+                        "single" => ExecutionMode::Single,
+                        "multi" => ExecutionMode::Multi,
+                        _ => {
+                            return Err("Invalid mode. Use single or multi".to_string());
+                        }
+                    };
+                }
+
+                "--help" | "-h" => {
+                    println!(
+                        "Usage: redis-clone \
+                         [--host HOST] [--port PORT] \
+                         [--mode single|multi]"
+                    );
+
+                    std::process::exit(0);
+                }
+
+                _ => {
+                    return Err(format!("Unknown argument: {}", arg));
+                }
+            }
+        }
+
+        Ok(Self { host, port, mode })
+    }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let config = Config::from_args().map_err(std::io::Error::other)?;
+
+    // Select the runtime based on the user's input.
+    let mut builder = match config.mode {
+        ExecutionMode::Single => Builder::new_current_thread(),
+
+        ExecutionMode::Multi => Builder::new_multi_thread(),
+    };
+
+    builder.enable_all();
+
+    let runtime = builder.build()?;
+
+    let address = format!("{}:{}", config.host, config.port);
+
+    println!("Execution mode: {:?}", config.mode);
+    println!("Binding address: {}", address);
+
+    runtime.block_on(async {
+        let db = SharedDb::new();
+
+        let server = Server::new(&address, db, config.mode).await?;
+
+        server.run().await
+    })?;
 
     Ok(())
 }

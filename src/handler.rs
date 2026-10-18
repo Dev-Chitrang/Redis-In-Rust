@@ -3,18 +3,23 @@ use crate::store::SharedDb;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
 pub struct Handler {
     db: SharedDb,
     stream: TcpStream,
     buffer: Vec<u8>,
+    command_lock: Option<Arc<Mutex<()>>>,
 }
 
 impl Handler {
-    pub fn new(db: SharedDb, stream: TcpStream) -> Self {
+    pub fn new(db: SharedDb, stream: TcpStream, command_lock: Option<Arc<Mutex<()>>>) -> Self {
         Self {
             db,
             stream,
             buffer: Vec::with_capacity(4096),
+            command_lock,
         }
     }
 
@@ -48,8 +53,19 @@ impl Handler {
                         self.buffer.drain(..consumed);
 
                         // Execute the command.
-                        let response_bytes = self.execute_command(cmd).await;
+                        let response_bytes = if matches!(&cmd, Commands::Subscribe { .. }) {
+                            // SUBSCRIBE enters a long-lived receive loop.
+                            // Do not hold the global command lock for its lifetime.
+                            self.execute_command(cmd).await
+                        } else if let Some(command_lock) = self.command_lock.clone() {
+                            // Single mode: execute one command at a time.
+                            let _guard = command_lock.lock().await;
 
+                            self.execute_command(cmd).await
+                        } else {
+                            // Multi mode: retain concurrent command execution.
+                            self.execute_command(cmd).await
+                        };
                         // Send the response to the client.
                         if !response_bytes.is_empty() {
                             self.stream.write_all(&response_bytes).await?;
