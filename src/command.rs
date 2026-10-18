@@ -1,8 +1,11 @@
-use crate::store::ZSetMember;
 use bytes::Bytes;
 
 #[derive(Debug, Clone)]
 pub enum Commands {
+    Hello,
+    Ping {
+        message: Option<Bytes>,
+    },
     // General commands
     Exists {
         key: String,
@@ -57,8 +60,7 @@ pub enum Commands {
     // Hashes
     HSet {
         key: String,
-        field: String,
-        value: Bytes,
+        fields: Vec<(String, Bytes)>,
     },
     HGet {
         key: String,
@@ -102,7 +104,7 @@ pub enum Commands {
     // Sets
     SAdd {
         key: String,
-        value: Bytes,
+        members: Vec<Bytes>,
     },
     SRem {
         key: String,
@@ -157,8 +159,14 @@ pub enum Commands {
 
 pub struct RespSerializer;
 
+#[derive(Debug)]
+pub enum ParseOutcome {
+    Complete(Commands, usize),
+    Incomplete,
+    Invalid(String),
+}
+
 impl RespSerializer {
-    // <-- Fixed: Typed "RespSerializer" matching definition struct name
     pub fn simple_string(s: &str) -> Vec<u8> {
         format!("+{}\r\n", s).into_bytes()
     }
@@ -173,7 +181,7 @@ impl RespSerializer {
 
     pub fn bulk_string(bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(format!("${}\r\n", bytes.len()).into_bytes()); // <-- Fixed: Added missing semicolon
+        out.extend_from_slice(&format!("${}\r\n", bytes.len()).into_bytes());
         out.extend_from_slice(bytes);
         out.extend_from_slice(b"\r\n");
         out
@@ -185,7 +193,7 @@ impl RespSerializer {
 
     pub fn array(elements: Vec<Vec<u8>>) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(format!("*{}\r\n", elements.len()).into_bytes());
+        out.extend_from_slice(&format!("*{}\r\n", elements.len()).into_bytes());
         for el in elements {
             out.extend_from_slice(&el);
         }
@@ -194,7 +202,27 @@ impl RespSerializer {
 }
 
 impl Commands {
-    pub fn parse(src: &[u8]) -> Option<(Self, usize)> {
+    pub fn parse(src: &[u8]) -> ParseOutcome {
+        match validate_resp_frame(src) {
+            Ok(None) => ParseOutcome::Incomplete,
+
+            Err(message) => ParseOutcome::Invalid(message),
+
+            Ok(Some(frame_len)) => match Self::parse_complete_command(&src[..frame_len]) {
+                Some((cmd, consumed)) if consumed == frame_len => {
+                    ParseOutcome::Complete(cmd, consumed)
+                }
+
+                Some(_) => ParseOutcome::Invalid(
+                    "Parser consumed an unexpected number of bytes".to_string(),
+                ),
+
+                None => ParseOutcome::Invalid("Invalid command or command arguments".to_string()),
+            },
+        }
+    }
+
+    pub fn parse_complete_command(src: &[u8]) -> Option<(Self, usize)> {
         if src.is_empty() {
             return None;
         }
@@ -247,6 +275,17 @@ impl Commands {
         let command_verb = std::str::from_utf8(&args.get(0)?).ok()?.to_uppercase();
 
         let cmd = match command_verb.as_str() {
+            "HELLO" => Commands::Hello,
+            "PING" => {
+                if let Some(arg1) = args.get(1) {
+                    Commands::Ping {
+                        message: Some(arg1.clone()),
+                    }
+                } else {
+                    Commands::Ping { message: None }
+                }
+            }
+
             "EXISTS" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 Commands::Exists { key }
@@ -303,7 +342,7 @@ impl Commands {
             "INCRBY" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let amount_bytes = args.get(2)?;
-                let amount_str = String::from_utf8(amount_bytes).ok()?;
+                let amount_str = String::from_utf8(amount_bytes.to_vec()).ok()?;
                 let amount = amount_str.trim().parse().unwrap_or(0);
                 Commands::IncrBy { key, amount }
             }
@@ -311,7 +350,7 @@ impl Commands {
             "DECRBY" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let amount_bytes = args.get(2)?;
-                let amount_str = String::from_utf8(amount_bytes).ok()?;
+                let amount_str = String::from_utf8(amount_bytes.to_vec()).ok()?;
                 let amount = amount_str.trim().parse().unwrap_or(0);
                 Commands::DecrBy { key, amount }
             }
@@ -342,9 +381,23 @@ impl Commands {
 
             "HSET" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let field = String::from_utf8_lossy(&args.get(2)?).into_owned();
-                let value = args.get(3)?.clone();
-                Commands::HSet { key, field, value }
+
+                if args.len() < 4 || args.len() % 2 != 0 {
+                    return None;
+                }
+
+                let mut fields = Vec::new();
+                let mut i = 2;
+
+                while i < args.len() {
+                    let field = String::from_utf8_lossy(&args[i]).into_owned();
+                    let value = args[i + 1].clone();
+
+                    fields.push((field, value));
+                    i += 2;
+                }
+
+                Commands::HSet { key, fields }
             }
 
             "HGET" => {
@@ -411,8 +464,14 @@ impl Commands {
 
             "SADD" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let value = args.get(2)?.clone();
-                Commands::SAdd { key, value }
+
+                if args.len() < 3 {
+                    return None;
+                }
+
+                let members = args[2..].to_vec();
+
+                Commands::SAdd { key, members }
             }
 
             "SREM" => {
@@ -469,7 +528,12 @@ impl Commands {
                     .unwrap_or(0);
                 let mut with_scores = false;
                 if let Some(arg4) = args.get(4) {
-                    if std::str::from_utf8(arg4.as_ref()).ok()?.to_uppercase().trim() == "WITHSCORES" {
+                    if std::str::from_utf8(arg4.as_ref())
+                        .ok()?
+                        .to_uppercase()
+                        .trim()
+                        == "WITHSCORES"
+                    {
                         with_scores = true;
                     }
                 }
@@ -514,4 +578,93 @@ fn read_line(src: &[u8]) -> Option<(&[u8], usize)> {
         }
     }
     None
+}
+
+fn validate_resp_frame(src: &[u8]) -> Result<Option<usize>, String> {
+    if src.is_empty() {
+        return Ok(None);
+    }
+
+    // Preserve your existing support for simple, non-array lines.
+    if src[0] != b'*' {
+        return match read_line(src) {
+            Some((_, consumed)) => Ok(Some(consumed)),
+            None => Ok(None),
+        };
+    }
+
+    // Read the RESP array length.
+    let (count_bytes, count_consumed) = match read_line(&src[1..]) {
+        Some(line) => line,
+        None => return Ok(None),
+    };
+
+    let count_str = std::str::from_utf8(count_bytes)
+        .map_err(|_| "Invalid array length encoding".to_string())?;
+
+    let array_len: usize = count_str
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid RESP array length".to_string())?;
+
+    // A practical limit for this server to prevent unreasonable input.
+    if array_len > 10_000 {
+        return Err("RESP array contains too many elements".to_string());
+    }
+
+    let mut idx = 1 + count_consumed;
+
+    for _ in 0..array_len {
+        if idx >= src.len() {
+            return Ok(None);
+        }
+
+        if src[idx] != b'$' {
+            return Err("Expected a RESP bulk string".to_string());
+        }
+
+        idx += 1;
+
+        // Read the bulk-string length.
+        let (len_bytes, len_consumed) = match read_line(&src[idx..]) {
+            Some(line) => line,
+            None => return Ok(None),
+        };
+
+        let len_str = std::str::from_utf8(len_bytes)
+            .map_err(|_| "Invalid bulk string length encoding".to_string())?;
+
+        let bulk_len: usize = len_str
+            .trim()
+            .parse()
+            .map_err(|_| "Invalid bulk string length".to_string())?;
+
+        // Prevent unreasonable payloads.
+        if bulk_len > 16 * 1024 * 1024 {
+            return Err("RESP bulk string is too large".to_string());
+        }
+
+        idx += len_consumed;
+
+        let payload_end = idx
+            .checked_add(bulk_len)
+            .ok_or_else(|| "Bulk string length overflow".to_string())?;
+
+        let frame_end = payload_end
+            .checked_add(2)
+            .ok_or_else(|| "Frame length overflow".to_string())?;
+
+        if frame_end > src.len() {
+            return Ok(None);
+        }
+
+        // Every bulk-string payload must end with CRLF.
+        if &src[payload_end..frame_end] != b"\r\n" {
+            return Err("Bulk string is missing its CRLF terminator".to_string());
+        }
+
+        idx = frame_end;
+    }
+
+    Ok(Some(idx))
 }

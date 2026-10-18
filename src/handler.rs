@@ -1,6 +1,5 @@
-use crate::command::{Commands, RespSerializer};
+use crate::command::{Commands, ParseOutcome, RespSerializer};
 use crate::store::SharedDb;
-use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -23,26 +22,78 @@ impl Handler {
         let mut read_buf = [0u8; 1024];
 
         loop {
+            // Read data from the client.
             let bytes_read = self.stream.read(&mut read_buf).await?;
+
+            // Client disconnected.
             if bytes_read == 0 {
                 return Ok(());
             }
 
+            // Append newly received bytes to the existing buffer.
             self.buffer.extend_from_slice(&read_buf[..bytes_read]);
 
-            while let Some((cmd, consumed)) = Commands::parse(&self.buffer) {
-                let response_bytes = self.execute_command(cmd).await;
+            // Process all complete commands in the buffer.
+            loop {
+                match Commands::parse(&self.buffer) {
+                    ParseOutcome::Complete(cmd, consumed) => {
+                        if consumed == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Parser consumed zero bytes",
+                            ));
+                        }
 
-                self.stream.write_all(&response_bytes).await?;
-                self.stream.flush().await?;
+                        // Remove the processed command.
+                        self.buffer.drain(..consumed);
 
-                self.buffer.drain(..consumed);
+                        // Execute the command.
+                        let response_bytes = self.execute_command(cmd).await;
+
+                        // Send the response to the client.
+                        if !response_bytes.is_empty() {
+                            self.stream.write_all(&response_bytes).await?;
+                            self.stream.flush().await?;
+                        }
+                    }
+
+                    ParseOutcome::Incomplete => {
+                        // Keep buffered bytes and wait for more data.
+                        break;
+                    }
+
+                    ParseOutcome::Invalid(message) => {
+                        let error =
+                            RespSerializer::error(&format!("ERR Protocol error: {}", message));
+
+                        self.stream.write_all(&error).await?;
+                        self.stream.flush().await?;
+
+                        // Close the connection after malformed input.
+                        return Ok(());
+                    }
+                }
             }
         }
     }
 
     async fn execute_command(&mut self, cmd: Commands) -> Vec<u8> {
         match cmd {
+            // Add this match arm inside execute_command:
+            Commands::Hello => RespSerializer::array(vec![
+                RespSerializer::bulk_string(b"server"),
+                RespSerializer::bulk_string(b"redis-clone"),
+                RespSerializer::bulk_string(b"proto"),
+                RespSerializer::bulk_string(b"2"),
+            ]),
+            Commands::Ping { message } => {
+                if let Some(msg) = message {
+                    RespSerializer::bulk_string(&msg)
+                } else {
+                    RespSerializer::simple_string("PONG")
+                }
+            }
+
             // --- General Key Operations ---
             Commands::Exists { key } => {
                 let res = self.db.exists(&key).await;
@@ -114,10 +165,11 @@ impl Handler {
             }
 
             // --- Hashes ---
-            Commands::HSet { key, field, value } => {
-                let res = self.db.hset(key, field, value).await;
-                RespSerializer::integer(res as i64)
+            Commands::HSet { key, fields } => {
+                let added = self.db.hset_many(key, fields).await;
+                RespSerializer::integer(added as i64)
             }
+
             Commands::HGet { key, field } => {
                 if let Some(bytes) = self.db.hget(&key, &field).await {
                     RespSerializer::bulk_string(&bytes)
@@ -181,20 +233,21 @@ impl Handler {
             }
 
             // --- Sets ---
-            Commands::SAdd { key, value } => {
-                let res = self.db.sadd(key, value).await;
-                RespSerializer::integer(res as i64)
+            Commands::SAdd { key, members } => {
+                let added = self.db.sadd_many(key, members).await;
+                RespSerializer::integer(added as i64)
             }
+
             Commands::SRem { key, value } => {
                 let res = self.db.srem(&key, &value).await;
                 RespSerializer::integer(res as i64)
             }
             Commands::SMembers { key } => {
-                if let Some(m) = self.db.smembers(&key).await {
-                    let elements = m
-                        .into_iter()
-                        .map(|b| RespSerializer::bulk_string(&b))
-                        .collect();
+                if let Some(members) = self.db.smembers(&key).await {
+                    let mut elements = Vec::new();
+                    for m in members {
+                        elements.push(RespSerializer::bulk_string(&m));
+                    }
                     RespSerializer::array(elements)
                 } else {
                     RespSerializer::array(vec![])
@@ -247,11 +300,28 @@ impl Handler {
                 RespSerializer::integer(subscriber_count as i64)
             }
             Commands::Subscribe { channel } => {
-                // Enter a blocking subscription state loop
-                if let Err(e) = self.handle_subscribe_stream(channel).await {
-                    return RespSerializer::error(&format!("ERP PubSub Stream Failure: {}", e));
+                // 1. Generate the confirmation array packet
+                let setup_reply = RespSerializer::array(vec![
+                    RespSerializer::bulk_string(b"subscribe"),
+                    RespSerializer::bulk_string(channel.as_bytes()),
+                    RespSerializer::integer(1),
+                ]);
+
+                // 2. Write it back to the socket immediately before entering the loop
+                if let Err(e) = self.stream.write_all(&setup_reply).await {
+                    return RespSerializer::error(&format!(
+                        "ERR Subscription Write Failure: {}",
+                        e
+                    ));
                 }
-                vec![]
+                let _ = self.stream.flush().await;
+
+                // 3. Drop into a one-way reactive broadcast stream reader loop
+                if let Err(e) = self.handle_subscribe_stream_only(channel).await {
+                    eprintln!("PubSub Stream Error: {}", e);
+                }
+
+                vec![] // Return empty to signal the command execution is done
             }
 
             Commands::Unknown(cmd_name) => {
@@ -290,6 +360,7 @@ impl Handler {
         if let Some(res) = self.db.zrange(key, start, end, reverse).await {
             let mut elements = Vec::new();
             for m in res {
+                // Treat m as a ZSetMember struct directly
                 elements.push(RespSerializer::bulk_string(&m.value));
                 if with_scores {
                     elements.push(RespSerializer::bulk_string(m.score.to_string().as_bytes()));
@@ -301,26 +372,25 @@ impl Handler {
         }
     }
 
-    async fn handle_subscribe_stream(&mut self, channel: String) -> Result<(), std::io::Error> {
+    async fn handle_subscribe_stream_only(
+        &mut self,
+        channel: String,
+    ) -> Result<(), std::io::Error> {
         let mut rx = self.db.subscribe(channel.clone()).await;
-        let setup_reply = RespSerializer::array(vec![
-            RespSerializer::bulk_string(b"subscribe"),
-            RespSerializer::bulk_string(channel.as_bytes()),
-            RespSerializer::integer(1),
-        ]);
-        self.stream.write_all(&setup_reply).await?;
-        self.stream.flush().await?;
 
         loop {
             tokio::select! {
                 msg_res = rx.recv() => {
                     match msg_res {
                         Ok(msg_bytes) => {
-                            let broadcast_packet = RespSerializer::array(vec![RespSerializer::bulk_string(b"message"), RespSerializer::bulk_string(channel.as_bytes()), RespSerializer::bulk_string(&msg_bytes)]);
+                            let broadcast_packet = RespSerializer::array(vec![
+                                RespSerializer::bulk_string(b"message"),
+                                RespSerializer::bulk_string(channel.as_bytes()),
+                                RespSerializer::bulk_string(&msg_bytes),
+                            ]);
                             self.stream.write_all(&broadcast_packet).await?;
                             self.stream.flush().await?;
                         }
-
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     }
@@ -328,7 +398,7 @@ impl Handler {
                 _ = self.stream.readable() => {
                     let mut probe = [0u8; 1];
                     if self.stream.try_read(&mut probe).is_ok() && probe[0] == 0 {
-                        break;
+                        break; // Client closed the connection
                     }
                 }
             }

@@ -66,7 +66,7 @@ impl SharedDb {
             if let Some(exp) = entry.expires_at {
                 if Instant::now() >= exp {
                     entries.remove(key);
-                    false
+                    return false;
                 }
             }
             return true;
@@ -223,9 +223,36 @@ impl SharedDb {
         });
 
         if let Value::Hash(ref mut map) = entry.value {
-            return map.insert(field, value).map(|_| 0).unwrap_or(1);
+            return if map.insert(field, value).is_none() {
+                1
+            } else {
+                0
+            };
         }
         0
+    }
+
+    pub async fn hset_many(&self, key: String, fields: Vec<(String, Bytes)>) -> usize {
+        let mut entries = self.0.entries.write().await;
+
+        let entry = entries.entry(key).or_insert(DbEntry {
+            value: Value::Hash(HashMap::new()),
+            expires_at: None,
+        });
+
+        if let Value::Hash(ref mut map) = entry.value {
+            let mut added = 0;
+
+            for (field, value) in fields {
+                if map.insert(field, value).is_none() {
+                    added += 1;
+                }
+            }
+
+            added
+        } else {
+            0
+        }
     }
 
     pub async fn hget(&self, key: &str, field: &str) -> Option<Bytes> {
@@ -359,6 +386,29 @@ impl SharedDb {
         0
     }
 
+    pub async fn sadd_many(&self, key: String, members: Vec<Bytes>) -> usize {
+        let mut entries = self.0.entries.write().await;
+
+        let entry = entries.entry(key).or_insert(DbEntry {
+            value: Value::Set(HashSet::new()),
+            expires_at: None,
+        });
+
+        if let Value::Set(ref mut set) = entry.value {
+            let mut added = 0;
+
+            for member in members {
+                if set.insert(member) {
+                    added += 1;
+                }
+            }
+
+            added
+        } else {
+            0
+        }
+    }
+
     pub async fn smembers(&self, key: &str) -> Option<Vec<Bytes>> {
         let entries = self.0.entries.read().await;
         if let Some(entry) = entries.get(key) {
@@ -431,9 +481,9 @@ impl SharedDb {
         &self,
         key: &str,
         start: i64,
-        stop: i64,
+        end: i64,
         reverse: bool,
-    ) -> Option<Vec<Bytes>> {
+    ) -> Option<Vec<ZSetMember>> {
         let entries = self.0.entries.read().await;
         if let Some(entry) = entries.get(key) {
             if let Value::SortedSet(ref zset) = entry.value {
@@ -443,12 +493,12 @@ impl SharedDb {
                 }
 
                 let mut start_index = if start < 0 { len + start } else { start };
-                let mut stop_index = if stop < 0 { len + stop } else { stop };
+                let mut stop_index = if end < 0 { len + end } else { end };
 
                 if start_index < 0 {
                     start_index = 0;
                 }
-                if stop_index > len {
+                if stop_index >= len {
                     stop_index = len - 1;
                 }
                 if start_index > stop_index {
@@ -487,7 +537,7 @@ impl SharedDb {
     pub async fn publish(&self, channel: &str, message: Bytes) -> usize {
         let pubsub = self.0.pubsub.read().await;
         if let Some(sender) = pubsub.get(channel) {
-            sender.send(message).unwrap_or(0);
+            sender.send(message).unwrap_or(0)
         } else {
             0
         }
