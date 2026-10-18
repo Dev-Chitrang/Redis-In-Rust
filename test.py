@@ -566,6 +566,80 @@ def test_protocol():
     except Exception as exc:
         check("Server survives client disconnect", False, str(exc))
 
+def test_phase1():
+    print("\n=== PHASE 1: COMMAND SEMANTICS ===")
+
+    # Variadic DEL and EXISTS
+    r.delete("p1:a", "p1:b", "p1:c")
+    r.set("p1:a", "1")
+    r.set("p1:b", "2")
+
+    check("EXISTS multiple keys", r.exists("p1:a", "p1:b", "p1:c") == 2)
+    check("DEL multiple keys", r.delete("p1:a", "p1:b", "p1:c") == 2)
+    check("DEL nonexistent keys", r.delete("p1:a", "p1:b") == 0)
+
+    # Variadic LPUSH and RPUSH
+    r.delete("p1:list")
+
+    r.lpush("p1:list", "a", "b", "c")
+    check(
+        "LPUSH multiple values",
+        r.lrange("p1:list", 0, -1) == ["c", "b", "a"],
+    )
+
+    r.delete("p1:list")
+    r.rpush("p1:list", "a", "b", "c")
+
+    check(
+        "RPUSH multiple values",
+        r.lrange("p1:list", 0, -1) == ["a", "b", "c"],
+    )
+
+    # SET options
+    r.delete("p1:set")
+
+    check("SET NX on missing key", r.set("p1:set", "first", nx=True) is True)
+    check("SET NX on existing key", r.set("p1:set", "second", nx=True) is None)
+    check("SET XX on existing key", r.set("p1:set", "updated", xx=True) is True)
+    check("SET XX on missing key", r.set("p1:missing", "x", xx=True) is None)
+    check("SET EX", r.set("p1:ex", "value", ex=10) is True)
+    check("SET PX", r.set("p1:px", "value", px=5000) is True)
+
+    check("SET EX creates TTL", 0 < r.ttl("p1:ex") <= 10)
+    check("SET PX creates PTTL", 0 < r.pttl("p1:px") <= 5000)
+
+    # PEXPIRE and PERSIST
+    r.set("p1:expire", "value")
+
+    check("PEXPIRE succeeds", r.pexpire("p1:expire", 5000) is True)
+    check("PEXPIRE creates PTTL", 0 < r.pttl("p1:expire") <= 5000)
+    check("PERSIST succeeds", r.persist("p1:expire") is True)
+    check("PERSIST removes TTL", r.ttl("p1:expire") == -1)
+    check("PERSIST without TTL", r.persist("p1:expire") is False)
+
+    # Invalid arguments should return errors without disconnecting.
+    with socket.create_connection((HOST, PORT), timeout=3) as sock:
+        sock.settimeout(3)
+
+        with sock.makefile("rb") as sock_file:
+            sock.sendall(
+                encode_command("INCRBY", "p1:number", "not-a-number")
+                + encode_command("PING")
+            )
+
+            invalid_result = read_resp(sock_file)
+            ping_result = read_resp(sock_file)
+
+            check(
+                "Invalid numeric argument returns error",
+                isinstance(invalid_result, tuple)
+                and invalid_result[0] == "ERROR",
+            )
+            check(
+                "Connection survives invalid command arguments",
+                ping_result == "PONG",
+            )
+
 
 # --------------------------------------------------
 # Main
@@ -591,6 +665,7 @@ def run_tests(mode):
 
     try:
         test_functional()
+        test_phase1()
         test_concurrency()
         test_atomicity()
         test_ttl()

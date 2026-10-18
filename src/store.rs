@@ -73,24 +73,34 @@ impl SharedDb {
 
     // Genral key operations
 
-    pub async fn exists(&self, key: &str) -> bool {
+    pub async fn exists(&self, keys: &[String]) -> usize {
         let mut entries = self.0.entries.write().await;
-        if let Some(entry) = entries.get(key) {
-            if let Some(exp) = entry.expires_at {
-                if Instant::now() >= exp {
-                    entries.remove(key);
-                    return false;
-                }
+        let mut count = 0;
+
+        for key in keys {
+            remove_if_expired(&mut entries, key);
+
+            if entries.contains_key(key) {
+                count += 1;
             }
-            return true;
         }
-        false
+
+        count
     }
 
-    pub async fn del(&self, key: &str) -> usize {
+    pub async fn del(&self, keys: &[String]) -> usize {
         let mut entries = self.0.entries.write().await;
-        remove_if_expired(&mut entries, key);
-        entries.remove(key).map(|_| 1).unwrap_or(0)
+        let mut deleted = 0;
+
+        for key in keys {
+            remove_if_expired(&mut entries, key);
+
+            if entries.remove(key).is_some() {
+                deleted += 1;
+            }
+        }
+
+        deleted
     }
 
     pub async fn expire(&self, key: &str, seconds: u64) -> usize {
@@ -122,6 +132,27 @@ impl SharedDb {
             return -1;
         }
         -2
+    }
+
+    pub async fn pttl(&self, key: &str) -> i64 {
+        let mut entries = self.0.entries.write().await;
+
+        match entries.get(key).map(|entry| entry.expires_at) {
+            None => -2,
+
+            Some(None) => -1,
+
+            Some(Some(expiration)) => {
+                let now = Instant::now();
+
+                if now >= expiration {
+                    entries.remove(key);
+                    -2
+                } else {
+                    (expiration - now).as_millis() as i64
+                }
+            }
+        }
     }
 
     pub async fn scan(&self) -> Vec<String> {
@@ -161,6 +192,40 @@ impl SharedDb {
                 expires_at: None,
             },
         );
+    }
+
+    pub async fn set_with_options(
+        &self,
+        key: String,
+        value: Bytes,
+        expiry: Option<std::time::Duration>,
+        nx: bool,
+        xx: bool,
+    ) -> bool {
+        let mut entries = self.0.entries.write().await;
+
+        remove_if_expired(&mut entries, &key);
+
+        let exists = entries.contains_key(&key);
+
+        if nx && exists {
+            return false;
+        }
+
+        if xx && !exists {
+            return false;
+        }
+
+        let expires_at = expiry.map(|duration| Instant::now() + duration);
+
+        entries.insert(
+            key,
+            DbEntry {
+                value: Value::String(value),
+                expires_at,
+            },
+        );
+        true
     }
 
     pub async fn get(&self, key: &str) -> Option<Bytes> {
@@ -339,6 +404,36 @@ impl SharedDb {
             return deque.len();
         }
         0
+    }
+
+    pub async fn push_list_many(
+        &self,
+        key: String,
+        values: Vec<Bytes>,
+        front: bool,
+    ) -> Result<usize, &'static str> {
+        let mut entries = self.0.entries.write().await;
+
+        remove_if_expired(&mut entries, &key);
+
+        let entry = entries.entry(key).or_insert(DbEntry {
+            value: Value::List(VecDeque::new()),
+            expires_at: None,
+        });
+
+        if let Value::List(ref mut deque) = entry.value {
+            for value in values {
+                if front {
+                    deque.push_front(value);
+                } else {
+                    deque.push_back(value);
+                }
+            }
+
+            Ok(deque.len())
+        } else {
+            Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 
     pub async fn pop_list(&self, key: &str, front: bool) -> Option<Bytes> {
@@ -611,5 +706,35 @@ impl SharedDb {
         });
 
         previous_count - entries.len()
+    }
+
+    pub async fn pexpire(&self, key: &str, milliseconds: u64) -> usize {
+        let mut entries = self.0.entries.write().await;
+
+        remove_if_expired(&mut entries, key);
+
+        if let Some(entry) = entries.get_mut(key) {
+            entry.expires_at =
+                Some(Instant::now() + std::time::Duration::from_millis(milliseconds));
+
+            return 1;
+        }
+
+        0
+    }
+
+    pub async fn persist(&self, key: &str) -> usize {
+        let mut entries = self.0.entries.write().await;
+
+        remove_if_expired(&mut entries, key);
+
+        if let Some(entry) = entries.get_mut(key) {
+            if entry.expires_at.is_some() {
+                entry.expires_at = None;
+                return 1;
+            }
+        }
+
+        0
     }
 }

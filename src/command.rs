@@ -8,16 +8,19 @@ pub enum Commands {
     },
     // General commands
     Exists {
-        key: String,
+        keys: Vec<String>,
     },
     Del {
-        key: String,
+        keys: Vec<String>,
     },
     Expire {
         key: String,
         seconds: u64,
     },
     Ttl {
+        key: String,
+    },
+    PTtl {
         key: String,
     },
     Scan,
@@ -27,6 +30,9 @@ pub enum Commands {
     Set {
         key: String,
         value: Bytes,
+        expiry: Option<std::time::Duration>,
+        nx: bool,
+        xx: bool,
     },
     Get {
         key: String,
@@ -80,14 +86,14 @@ pub enum Commands {
     // Lists
     LPush {
         key: String,
-        value: Bytes,
+        values: Vec<Bytes>,
     },
     LPop {
         key: String,
     },
     RPush {
         key: String,
-        value: Bytes,
+        values: Vec<Bytes>,
     },
     RPop {
         key: String,
@@ -154,6 +160,16 @@ pub enum Commands {
         channel: String,
     },
 
+    PExpire {
+        key: String,
+        milliseconds: u64,
+    },
+
+    Persist {
+        key: String,
+    },
+
+    Error(String),
     Unknown(String),
 }
 
@@ -217,7 +233,10 @@ impl Commands {
                     "Parser consumed an unexpected number of bytes".to_string(),
                 ),
 
-                None => ParseOutcome::Invalid("Invalid command or command arguments".to_string()),
+                None => ParseOutcome::Complete(
+                    Commands::Error("ERR invalid command arguments".to_string()),
+                    frame_len,
+                ),
             },
         }
     }
@@ -274,6 +293,10 @@ impl Commands {
         let total_consumed = idx;
         let command_verb = std::str::from_utf8(&args.get(0)?).ok()?.to_uppercase();
 
+        if let Err(message) = validate_command_args(&command_verb, args.len()) {
+            return Some((Commands::Error(message), total_consumed));
+        }
+
         let cmd = match command_verb.as_str() {
             "HELLO" => Commands::Hello,
             "PING" => {
@@ -287,25 +310,48 @@ impl Commands {
             }
 
             "EXISTS" => {
-                let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                Commands::Exists { key }
+                let keys = args[1..]
+                    .iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+                Commands::Exists { keys }
             }
 
             "DEL" => {
-                let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                Commands::Del { key }
+                let keys = args[1..]
+                    .iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+                Commands::Del { keys }
             }
 
             "EXPIRE" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let seconds_str = String::from_utf8(args.get(2)?.to_vec()).ok()?;
-                let seconds = seconds_str.trim().parse().unwrap_or(0);
+                let seconds = seconds_str.trim().parse::<u64>().ok()?;
                 Commands::Expire { key, seconds }
+            }
+
+            "PEXPIRE" => {
+                let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
+                let milliseconds_str = String::from_utf8(args.get(2)?.to_vec()).ok()?;
+                let milliseconds = milliseconds_str.trim().parse::<u64>().ok()? / 1000;
+                Commands::PExpire { key, milliseconds }
+            }
+
+            "PERSIST" => {
+                let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
+                Commands::Persist { key }
             }
 
             "TTL" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 Commands::Ttl { key }
+            }
+
+            "PTTL" => {
+                let key = String::from_utf8_lossy(&args[1]).into_owned();
+                Commands::PTtl { key }
             }
 
             "SCAN" => Commands::Scan,
@@ -314,8 +360,58 @@ impl Commands {
 
             "SET" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let value = args.get(2)?.clone();
-                Commands::Set { key, value }
+                let value = args[2].clone();
+
+                let mut expiry = None;
+                let mut nx = false;
+                let mut xx = false;
+                let mut i = 3;
+
+                while i < args.len() {
+                    let option = String::from_utf8_lossy(&args[i]).to_uppercase();
+                    match option.as_str() {
+                        "EX" | "PX" => {
+                            if expiry.is_some() || i + 1 >= args.len() {
+                                return None;
+                            }
+                            let amount = std::str::from_utf8(&args[i + 1])
+                                .ok()?
+                                .parse::<u64>()
+                                .ok()?;
+                            if amount == 0 {
+                                return None;
+                            }
+                            expiry = Some(if option == "EX" {
+                                std::time::Duration::from_secs(amount)
+                            } else {
+                                std::time::Duration::from_millis(amount)
+                            });
+                            i += 2;
+                        }
+                        "NX" => {
+                            if nx || xx {
+                                return None;
+                            }
+                            nx = true;
+                            i += 1
+                        }
+                        "XX" => {
+                            if xx || nx {
+                                return None;
+                            }
+                            xx = true;
+                            i += 1;
+                        }
+                        _ => return None,
+                    }
+                }
+                Commands::Set {
+                    key,
+                    value,
+                    expiry,
+                    nx,
+                    xx,
+                }
             }
 
             "GET" => {
@@ -343,7 +439,7 @@ impl Commands {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let amount_bytes = args.get(2)?;
                 let amount_str = String::from_utf8(amount_bytes.to_vec()).ok()?;
-                let amount = amount_str.trim().parse().unwrap_or(0);
+                let amount = amount_str.trim().parse::<i64>().ok()?;
                 Commands::IncrBy { key, amount }
             }
 
@@ -351,7 +447,7 @@ impl Commands {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let amount_bytes = args.get(2)?;
                 let amount_str = String::from_utf8(amount_bytes.to_vec()).ok()?;
-                let amount = amount_str.trim().parse().unwrap_or(0);
+                let amount = amount_str.trim().parse::<i64>().ok()?;
                 Commands::DecrBy { key, amount }
             }
 
@@ -424,14 +520,14 @@ impl Commands {
 
             "LPUSH" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let value = args.get(2)?.clone();
-                Commands::LPush { key, value }
+                let values = args[2..].to_vec();
+                Commands::LPush { key, values }
             }
 
             "RPUSH" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let value = args.get(2)?.clone();
-                Commands::RPush { key, value }
+                let values = args[2..].to_vec();
+                Commands::RPush { key, values }
             }
 
             "LPOP" => {
@@ -447,9 +543,9 @@ impl Commands {
             "LRANGE" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let start_str = std::str::from_utf8(&args.get(2)?).ok()?;
-                let start = start_str.trim().parse().unwrap_or(0);
+                let start = start_str.trim().parse::<i64>().ok()?;
                 let stop_str = std::str::from_utf8(&args.get(3)?).ok()?;
-                let stop = stop_str.trim().parse().unwrap_or(0);
+                let stop = stop_str.trim().parse::<i64>().ok()?;
                 Commands::LRange {
                     key,
                     start,
@@ -667,4 +763,49 @@ fn validate_resp_frame(src: &[u8]) -> Result<Option<usize>, String> {
     }
 
     Ok(Some(idx))
+}
+
+fn validate_command_args(command: &str, argc: usize) -> Result<(), String> {
+    let valid = match command {
+        // Zero or one argument
+        "HELLO" | "SCAN" | "FLUSHALL" => argc == 1,
+        "PING" => (1..=2).contains(&argc),
+
+        // Exactly one key
+        "TTL" | "PTTL" | "PERSIST" | "GET" | "INCR" | "DECR" | "HGETALL" | "HKEYS" | "LPOP"
+        | "RPOP" | "LLEN" | "SMEMBERS" => argc == 2,
+
+        // One or more keys
+        "EXISTS" | "DEL" | "MGET" => argc >= 2,
+
+        // Exactly two arguments after the command
+        "EXPIRE" | "PEXPIRE" | "SETNX" | "INCRBY" | "DECRBY" | "HGET" | "HDEL" | "SREM"
+        | "SISMEMBER" | "ZREM" | "PUBLISH" => argc == 3,
+
+        "SUBSCRIBE" => argc == 2,
+
+        "SET" => argc >= 3,
+
+        "HSET" => argc >= 4 && argc % 2 == 0,
+
+        "LPUSH" | "RPUSH" | "SADD" => argc >= 3,
+
+        "LRANGE" | "ZADD" | "SINTER" => argc == 4,
+
+        "ZRANGE" | "ZREVRANGE" => argc == 4 || (argc == 5 && argc > 1),
+
+        "MSET" => argc >= 3 && argc % 2 == 1,
+
+        // Commands that accept an optional WITHSCORES argument
+        _ => true,
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "ERR wrong number of arguments for '{}'",
+            command.to_lowercase()
+        ))
+    }
 }

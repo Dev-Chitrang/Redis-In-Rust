@@ -95,6 +95,7 @@ impl Handler {
 
     async fn execute_command(&mut self, cmd: Commands) -> Vec<u8> {
         match cmd {
+            Commands::Error(message) => RespSerializer::error(&message),
             // Add this match arm inside execute_command:
             Commands::Hello => RespSerializer::array(vec![
                 RespSerializer::bulk_string(b"server"),
@@ -111,12 +112,12 @@ impl Handler {
             }
 
             // --- General Key Operations ---
-            Commands::Exists { key } => {
-                let res = self.db.exists(&key).await;
-                RespSerializer::integer(if res { 1 } else { 0 })
+            Commands::Exists { keys } => {
+                let count = self.db.exists(&keys).await;
+                RespSerializer::integer(count as i64)
             }
-            Commands::Del { key } => {
-                let count = self.db.del(&key).await;
+            Commands::Del { keys } => {
+                let count = self.db.del(&keys).await;
                 RespSerializer::integer(count as i64)
             }
             Commands::Expire { key, seconds } => {
@@ -125,6 +126,10 @@ impl Handler {
             }
             Commands::Ttl { key } => {
                 let remaining = self.db.ttl(&key).await;
+                RespSerializer::integer(remaining)
+            }
+            Commands::PTtl { key } => {
+                let remaining = self.db.pttl(&key).await;
                 RespSerializer::integer(remaining)
             }
             Commands::Scan => {
@@ -141,9 +146,20 @@ impl Handler {
             }
 
             // --- Strings & Numeric Operations ---
-            Commands::Set { key, value } => {
-                self.db.set(key, value).await;
-                self.simple_ok()
+            Commands::Set {
+                key,
+                value,
+                expiry,
+                nx,
+                xx,
+            } => {
+                let result = self.db.set_with_options(key, value, expiry, nx, xx).await;
+
+                if result {
+                    RespSerializer::simple_string("OK")
+                } else {
+                    RespSerializer::null_bulk_string()
+                }
             }
             Commands::Get { key } => {
                 if let Some(bytes) = self.db.get(&key).await {
@@ -222,13 +238,18 @@ impl Handler {
             }
 
             // --- Lists ---
-            Commands::LPush { key, value } => {
-                let len = self.db.push_list(key, value, true).await;
-                RespSerializer::integer(len as i64)
+            Commands::LPush { key, values } => {
+                match self.db.push_list_many(key, values, true).await {
+                    Ok(len) => RespSerializer::integer(len as i64),
+                    Err(error) => RespSerializer::error(error),
+                }
             }
-            Commands::RPush { key, value } => {
-                let len = self.db.push_list(key, value, false).await;
-                RespSerializer::integer(len as i64)
+
+            Commands::RPush { key, values } => {
+                match self.db.push_list_many(key, values, false).await {
+                    Ok(len) => RespSerializer::integer(len as i64),
+                    Err(error) => RespSerializer::error(error),
+                }
             }
             Commands::LPop { key } => self.handle_pop_list(&key, true).await,
             Commands::RPop { key } => self.handle_pop_list(&key, false).await,
@@ -338,6 +359,16 @@ impl Handler {
                 }
 
                 vec![] // Return empty to signal the command execution is done
+            }
+
+            Commands::PExpire { key, milliseconds } => {
+                let result = self.db.pexpire(&key, milliseconds).await;
+                RespSerializer::integer(result as i64)
+            }
+
+            Commands::Persist { key } => {
+                let result = self.db.persist(&key).await;
+                RespSerializer::integer(result as i64)
             }
 
             Commands::Unknown(cmd_name) => {
