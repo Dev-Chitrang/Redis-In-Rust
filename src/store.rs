@@ -1,9 +1,12 @@
 use bytes::Bytes;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::Instant;
+
+const SHARED_COUNT: usize = 64;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ZSetMember {
@@ -43,7 +46,8 @@ pub struct DbEntry {
 
 #[derive(Debug)]
 pub struct Db {
-    pub entries: RwLock<HashMap<String, DbEntry>>,
+    pub shards: Vec<RwLock<HashMap<String, DbEntry>>>,
+    pub operation_gate: RwLock<()>,
     pub pubsub: RwLock<HashMap<String, broadcast::Sender<Bytes>>>,
 }
 
@@ -65,19 +69,35 @@ fn remove_if_expired(entries: &mut HashMap<String, DbEntry>, key: &str) {
 
 impl SharedDb {
     pub fn new() -> Self {
-        SharedDb(Arc::new(Db {
-            entries: RwLock::new(HashMap::new()),
+        let shards = (0..SHARED_COUNT)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect();
+        Self(Arc::new(Db {
+            shards,
+            operation_gate: RwLock::new(()),
             pubsub: RwLock::new(HashMap::new()),
         }))
+    }
+
+    fn shard_index(key: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+
+        (hasher.finish() as usize) % SHARED_COUNT
+    }
+
+    fn shard(&self, key: &str) -> &RwLock<HashMap<String, DbEntry>> {
+        &self.0.shards[Self::shard_index(key)]
     }
 
     // Genral key operations
 
     pub async fn exists(&self, keys: &[String]) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.write().await;
         let mut count = 0;
 
         for key in keys {
+            let mut entries = self.shard(key).write().await;
             remove_if_expired(&mut entries, key);
 
             if entries.contains_key(key) {
@@ -89,10 +109,11 @@ impl SharedDb {
     }
 
     pub async fn del(&self, keys: &[String]) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.write().await;
         let mut deleted = 0;
 
         for key in keys {
+            let mut entries = self.shard(&key).write().await;
             remove_if_expired(&mut entries, key);
 
             if entries.remove(key).is_some() {
@@ -104,7 +125,8 @@ impl SharedDb {
     }
 
     pub async fn expire(&self, key: &str, seconds: u64) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
         if let Some(entry) = entries.get_mut(key) {
             if let Some(exp) = entry.expires_at {
                 if Instant::now() >= exp {
@@ -119,7 +141,8 @@ impl SharedDb {
     }
 
     pub async fn ttl(&self, key: &str) -> i64 {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
         if let Some(entry) = entries.get(key) {
             if let Some(exp) = entry.expires_at {
                 let now = Instant::now();
@@ -135,7 +158,8 @@ impl SharedDb {
     }
 
     pub async fn pttl(&self, key: &str) -> i64 {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
 
         match entries.get(key).map(|entry| entry.expires_at) {
             None => -2,
@@ -156,35 +180,39 @@ impl SharedDb {
     }
 
     pub async fn scan(&self) -> Vec<String> {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.write().await;
         let now = Instant::now();
         let mut keys = Vec::new();
-        let mut expired = Vec::new();
 
-        for (k, entry) in entries.iter() {
-            if let Some(exp) = entry.expires_at {
-                if now >= exp {
-                    expired.push(k.clone());
-                    continue;
+        for shard in &self.0.shards {
+            let mut entries = shard.write().await;
+            entries.retain(|key, entry| {
+                if let Some(expiration) = entry.expires_at {
+                    if now >= expiration {
+                        return false;
+                    }
                 }
-            }
-            keys.push(k.clone());
-        }
-        for k in expired {
-            entries.remove(&k);
+                keys.push(key.clone());
+                true
+            });
         }
         keys
     }
 
     pub async fn flushall(&self) {
-        let mut entries = self.0.entries.write().await;
-        entries.clear();
+        let _gate = self.0.operation_gate.write().await;
+
+        for shard in &self.0.shards {
+            let mut entries = shard.write().await;
+            entries.clear();
+        }
     }
 
     // Strings and numeric operations
 
     pub async fn set(&self, key: String, value: Bytes) {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
         entries.insert(
             key,
             DbEntry {
@@ -202,7 +230,8 @@ impl SharedDb {
         nx: bool,
         xx: bool,
     ) -> bool {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
 
         remove_if_expired(&mut entries, &key);
 
@@ -229,7 +258,8 @@ impl SharedDb {
     }
 
     pub async fn get(&self, key: &str) -> Option<Bytes> {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
         if let Some(entry) = entries.get(key) {
             if let Some(exp) = entry.expires_at {
                 if Instant::now() >= exp {
@@ -245,20 +275,10 @@ impl SharedDb {
     }
 
     pub async fn setnx(&self, key: String, value: Bytes) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
+        remove_if_expired(&mut entries, &key);
         if entries.contains_key(&key) {
-            if let Some(exp) = entries.get(&key).unwrap().expires_at {
-                if Instant::now() >= exp {
-                    entries.insert(
-                        key,
-                        DbEntry {
-                            value: Value::String(value),
-                            expires_at: None,
-                        },
-                    );
-                    return 1;
-                }
-            }
             return 0;
         }
         entries.insert(
@@ -272,7 +292,8 @@ impl SharedDb {
     }
 
     pub async fn incrby(&self, key: String, amount: i64) -> Result<i64, &'static str> {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
         let entry = entries.entry(key).or_insert(DbEntry {
             value: Value::String(Bytes::from("0")),
@@ -296,7 +317,8 @@ impl SharedDb {
     // Hashes Engine
 
     pub async fn hset(&self, key: String, field: String, value: Bytes) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
         let entry = entries.entry(key).or_insert(DbEntry {
             value: Value::Hash(HashMap::new()),
@@ -314,7 +336,8 @@ impl SharedDb {
     }
 
     pub async fn hset_many(&self, key: String, fields: Vec<(String, Bytes)>) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
         let entry = entries.entry(key).or_insert(DbEntry {
             value: Value::Hash(HashMap::new()),
@@ -337,7 +360,8 @@ impl SharedDb {
     }
 
     pub async fn hget(&self, key: &str, field: &str) -> Option<Bytes> {
-        let entries = self.0.entries.read().await;
+        let _gate = self.0.operation_gate.read().await;
+        let entries = self.shard(key).read().await;
         if let Some(entry) = entries.get(key) {
             if is_expired(entry) {
                 return None;
@@ -350,7 +374,8 @@ impl SharedDb {
     }
 
     pub async fn hgetall(&self, key: &str) -> Option<Vec<(String, Bytes)>> {
-        let entries = self.0.entries.read().await;
+        let _gate = self.0.operation_gate.read().await;
+        let entries = self.shard(key).read().await;
         if let Some(entry) = entries.get(key) {
             if is_expired(entry) {
                 return None;
@@ -363,7 +388,8 @@ impl SharedDb {
     }
 
     pub async fn hdel(&self, key: &str, field: &str) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
         remove_if_expired(&mut entries, key);
         if let Some(entry) = entries.get_mut(key) {
             if let Value::Hash(ref mut map) = entry.value {
@@ -374,7 +400,8 @@ impl SharedDb {
     }
 
     pub async fn hkeys(&self, key: &str) -> Option<Vec<String>> {
-        let entries = self.0.entries.read().await;
+        let _gate = self.0.operation_gate.read().await;
+        let entries = self.shard(key).read().await;
         if let Some(entry) = entries.get(key) {
             if is_expired(entry) {
                 return None;
@@ -388,7 +415,8 @@ impl SharedDb {
 
     // List engine
     pub async fn push_list(&self, key: String, value: Bytes, front: bool) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
         let entry = entries.entry(key).or_insert(DbEntry {
             value: Value::List(VecDeque::new()),
@@ -412,7 +440,8 @@ impl SharedDb {
         values: Vec<Bytes>,
         front: bool,
     ) -> Result<usize, &'static str> {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
 
         remove_if_expired(&mut entries, &key);
 
@@ -437,7 +466,8 @@ impl SharedDb {
     }
 
     pub async fn pop_list(&self, key: &str, front: bool) -> Option<Bytes> {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
         remove_if_expired(&mut entries, key);
         if let Some(entry) = entries.get_mut(key) {
             if let Value::List(ref mut deque) = entry.value {
@@ -452,7 +482,8 @@ impl SharedDb {
     }
 
     pub async fn lrange(&self, key: &str, start: i64, stop: i64) -> Option<Vec<Bytes>> {
-        let entries = self.0.entries.read().await;
+        let _gate = self.0.operation_gate.read().await;
+        let entries = self.shard(key).read().await;
         if let Some(entry) = entries.get(key) {
             if is_expired(entry) {
                 return None;
@@ -489,7 +520,8 @@ impl SharedDb {
     }
 
     pub async fn llen(&self, key: &str) -> usize {
-        let entries = self.0.entries.read().await;
+        let _gate = self.0.operation_gate.read().await;
+        let entries = self.shard(key).read().await;
         if let Some(entry) = entries.get(key) {
             if is_expired(entry) {
                 return 0;
@@ -504,7 +536,8 @@ impl SharedDb {
     // Sets engine
 
     pub async fn sadd(&self, key: String, member: Bytes) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
         let entry = entries.entry(key).or_insert(DbEntry {
             value: Value::Set(HashSet::new()),
@@ -517,7 +550,8 @@ impl SharedDb {
     }
 
     pub async fn sadd_many(&self, key: String, members: Vec<Bytes>) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
         let entry = entries.entry(key).or_insert(DbEntry {
             value: Value::Set(HashSet::new()),
@@ -540,7 +574,8 @@ impl SharedDb {
     }
 
     pub async fn smembers(&self, key: &str) -> Option<Vec<Bytes>> {
-        let entries = self.0.entries.read().await;
+        let _gate = self.0.operation_gate.read().await;
+        let entries = self.shard(key).read().await;
         if let Some(entry) = entries.get(key) {
             if is_expired(entry) {
                 return None;
@@ -553,7 +588,8 @@ impl SharedDb {
     }
 
     pub async fn sismember(&self, key: &str, member: &Bytes) -> usize {
-        let entries = self.0.entries.read().await;
+        let _gate = self.0.operation_gate.read().await;
+        let entries = self.shard(key).read().await;
         if let Some(entry) = entries.get(key) {
             if is_expired(entry) {
                 return 0;
@@ -566,7 +602,8 @@ impl SharedDb {
     }
 
     pub async fn srem(&self, key: &str, member: &Bytes) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
         remove_if_expired(&mut entries, key);
         if let Some(entry) = entries.get_mut(key) {
             if let Value::Set(ref mut set) = entry.value {
@@ -577,28 +614,40 @@ impl SharedDb {
     }
 
     pub async fn sinter(&self, key1: &str, key2: &str) -> Vec<Bytes> {
-        let entries = self.0.entries.read().await;
-        let set1 = match entries.get(key1) {
-            Some(entry) if !is_expired(entry) => match &entry.value {
-                Value::Set(set) => set,
+        let _gate = self.0.operation_gate.write().await;
+
+        let set1 = {
+            let entries = self.shard(key1).read().await;
+
+            match entries.get(key1) {
+                Some(entry) if !is_expired(entry) => match &entry.value {
+                    Value::Set(set) => set.clone(),
+                    _ => return vec![],
+                },
                 _ => return vec![],
-            },
-            _ => return vec![],
+            }
         };
-        let set2 = match entries.get(key2) {
-            Some(entry) if !is_expired(entry) => match &entry.value {
-                Value::Set(set) => set,
+
+        let set2 = {
+            let entries = self.shard(key2).read().await;
+
+            match entries.get(key2) {
+                Some(entry) if !is_expired(entry) => match &entry.value {
+                    Value::Set(set) => set.clone(),
+                    _ => return vec![],
+                },
                 _ => return vec![],
-            },
-            _ => return vec![],
+            }
         };
-        set1.intersection(set2).cloned().collect()
+
+        set1.intersection(&set2).cloned().collect()
     }
 
     // Sorted sets engine
 
     pub async fn zadd(&self, key: String, score: i64, value: Bytes) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
         let entry = entries.entry(key).or_insert(DbEntry {
             value: Value::SortedSet(BTreeSet::new()),
@@ -622,7 +671,8 @@ impl SharedDb {
         end: i64,
         reverse: bool,
     ) -> Option<Vec<ZSetMember>> {
-        let entries = self.0.entries.read().await;
+        let _gate = self.0.operation_gate.read().await;
+        let entries = self.shard(key).read().await;
         if let Some(entry) = entries.get(key) {
             if is_expired(entry) {
                 return None;
@@ -663,7 +713,8 @@ impl SharedDb {
     }
 
     pub async fn zrem(&self, key: &str, value: &Bytes) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
         remove_if_expired(&mut entries, key);
         if let Some(entry) = entries.get_mut(key) {
             if let Value::SortedSet(ref mut zset) = entry.value {
@@ -695,21 +746,26 @@ impl SharedDb {
     }
 
     pub async fn remove_expired(&self) -> usize {
-        let mut entries = self.0.entries.write().await;
-
+        let _gate = self.0.operation_gate.write().await;
         let now = Instant::now();
-        let previous_count = entries.len();
+        let mut removed = 0;
 
-        entries.retain(|_, entry| match entry.expires_at {
-            Some(expiration) => now < expiration,
-            None => true,
-        });
+        for shard in &self.0.shards {
+            let mut entries = shard.write().await;
+            let previous_count = entries.len();
 
-        previous_count - entries.len()
+            entries.retain(|_, entry| match entry.expires_at {
+                Some(expiration) => now < expiration,
+                None => true,
+            });
+            removed += previous_count - entries.len();
+        }
+        removed
     }
 
     pub async fn pexpire(&self, key: &str, milliseconds: u64) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
 
         remove_if_expired(&mut entries, key);
 
@@ -724,7 +780,8 @@ impl SharedDb {
     }
 
     pub async fn persist(&self, key: &str) -> usize {
-        let mut entries = self.0.entries.write().await;
+        let _gate = self.0.operation_gate.read().await;
+        let mut entries = self.shard(key).write().await;
 
         remove_if_expired(&mut entries, key);
 

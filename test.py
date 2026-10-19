@@ -640,6 +640,43 @@ def test_phase1():
                 ping_result == "PONG",
             )
 
+def test_sharded_key_operations():
+    print("\n=== SHARDED KEY OPERATIONS ===")
+
+    workers = 16
+    operations_per_worker = 100
+
+    def worker(worker_id):
+        client = redis.Redis(
+            host=HOST,
+            port=PORT,
+            decode_responses=True,
+            protocol=2,
+            socket_timeout=10,
+        )
+
+        key = f"test:sharded:{worker_id}"
+
+        try:
+            client.set(key, 0)
+
+            for _ in range(operations_per_worker):
+                client.incr(key)
+
+            return int(client.get(key))
+        finally:
+            client.close()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(worker, range(workers)))
+
+    expected = operations_per_worker
+
+    check(
+        "Concurrent operations on separate keys",
+        all(value == expected for value in results),
+        f"(expected {expected} per key, got {results})",
+    )
 
 # --------------------------------------------------
 # Main
@@ -670,6 +707,7 @@ def run_tests(mode):
         test_atomicity()
         test_ttl()
         test_protocol()
+        test_sharded_key_operations()
 
     except Exception as exc:
         failures.append(f"Unexpected test exception: {exc}")
