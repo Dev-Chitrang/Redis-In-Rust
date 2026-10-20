@@ -1,96 +1,371 @@
 use crate::command::{Commands, ParseOutcome, RespSerializer};
 use crate::store::SharedDb;
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
 pub struct Handler {
     db: SharedDb,
     stream: TcpStream,
     buffer: Vec<u8>,
     command_lock: Option<Arc<Mutex<()>>>,
+
+    channel_subscriptions: HashMap<String, JoinHandle<()>>,
+    pattern_subscriptions: HashMap<String, JoinHandle<()>>,
+
+    pubsub_tx: mpsc::UnboundedSender<PubSubEvent>,
+    pubsub_rx: mpsc::UnboundedReceiver<PubSubEvent>,
+}
+
+enum PubSubEvent {
+    Message {
+        channel: String,
+        message: Bytes,
+    },
+    PatternMessage {
+        pattern: String,
+        channel: String,
+        message: Bytes,
+    },
 }
 
 impl Handler {
     pub fn new(db: SharedDb, stream: TcpStream, command_lock: Option<Arc<Mutex<()>>>) -> Self {
+        let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
         Self {
             db,
             stream,
             buffer: Vec::with_capacity(4096),
             command_lock,
+
+            channel_subscriptions: HashMap::new(),
+            pattern_subscriptions: HashMap::new(),
+
+            pubsub_tx,
+            pubsub_rx,
         }
     }
 
     pub async fn run(mut self) -> Result<(), std::io::Error> {
+        let result = self.run_loop().await;
+
+        // Cleanup runs on disconnect and on connection errors.
+        self.cleanup_subscriptions().await;
+
+        result
+    }
+
+    async fn run_loop(&mut self) -> Result<(), std::io::Error> {
         let mut read_buf = [0u8; 1024];
 
         loop {
-            // Read data from the client.
-            let bytes_read = self.stream.read(&mut read_buf).await?;
+            tokio::select! {
+                read_result = self.stream.read(&mut read_buf) => {
+                    let bytes_read = read_result?;
 
-            // Client disconnected.
-            if bytes_read == 0 {
-                return Ok(());
-            }
-
-            // Append newly received bytes to the existing buffer.
-            self.buffer.extend_from_slice(&read_buf[..bytes_read]);
-
-            // Process all complete commands in the buffer.
-            loop {
-                match Commands::parse(&self.buffer) {
-                    ParseOutcome::Complete(cmd, consumed) => {
-                        if consumed == 0 {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "Parser consumed zero bytes",
-                            ));
-                        }
-
-                        // Remove the processed command.
-                        self.buffer.drain(..consumed);
-
-                        // Execute the command.
-                        let response_bytes = if matches!(&cmd, Commands::Subscribe { .. }) {
-                            // SUBSCRIBE enters a long-lived receive loop.
-                            // Do not hold the global command lock for its lifetime.
-                            self.execute_command(cmd).await
-                        } else if let Some(command_lock) = self.command_lock.clone() {
-                            // Single mode: execute one command at a time.
-                            let _guard = command_lock.lock().await;
-
-                            self.execute_command(cmd).await
-                        } else {
-                            // Multi mode: retain concurrent command execution.
-                            self.execute_command(cmd).await
-                        };
-                        // Send the response to the client.
-                        if !response_bytes.is_empty() {
-                            self.stream.write_all(&response_bytes).await?;
-                            self.stream.flush().await?;
-                        }
-                    }
-
-                    ParseOutcome::Incomplete => {
-                        // Keep buffered bytes and wait for more data.
-                        break;
-                    }
-
-                    ParseOutcome::Invalid(message) => {
-                        let error =
-                            RespSerializer::error(&format!("ERR Protocol error: {}", message));
-
-                        self.stream.write_all(&error).await?;
-                        self.stream.flush().await?;
-
-                        // Close the connection after malformed input.
+                    if bytes_read == 0 {
                         return Ok(());
+                    }
+
+                    self.buffer.extend_from_slice(
+                        &read_buf[..bytes_read]
+                    );
+
+                    self.process_buffered_commands().await?;
+                }
+
+                event = self.pubsub_rx.recv() => {
+                    if let Some(event) = event {
+                        self.write_pubsub_event(event).await?;
                     }
                 }
             }
         }
+    }
+
+    async fn process_buffered_commands(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            match Commands::parse(&self.buffer) {
+                ParseOutcome::Complete(cmd, consumed) => {
+                    if consumed == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Parser consumed zero bytes",
+                        ));
+                    }
+
+                    self.buffer.drain(..consumed);
+
+                    let response = if let Some(command_lock) = self.command_lock.clone() {
+                        let _guard = command_lock.lock().await;
+                        self.execute_command(cmd).await
+                    } else {
+                        self.execute_command(cmd).await
+                    };
+
+                    if !response.is_empty() {
+                        self.stream.write_all(&response).await?;
+                        self.stream.flush().await?;
+                    }
+                }
+
+                ParseOutcome::Incomplete => break,
+
+                ParseOutcome::Invalid(message) => {
+                    let error = RespSerializer::error(&format!("ERR Protocol error: {}", message));
+
+                    self.stream.write_all(&error).await?;
+                    self.stream.flush().await?;
+
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid RESP protocol frame",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn subscribe_channels(&mut self, channels: Vec<String>) -> Vec<u8> {
+        let mut output = Vec::new();
+
+        for channel in channels {
+            if !self.channel_subscriptions.contains_key(&channel) {
+                let mut rx = self.db.subscribe(channel.clone()).await;
+                let tx = self.pubsub_tx.clone();
+                let subscribed_channel = channel.clone();
+
+                let task = tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(message) => {
+                                if tx
+                                    .send(PubSubEvent::Message {
+                                        channel: subscribed_channel.clone(),
+                                        message,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                self.channel_subscriptions.insert(channel.clone(), task);
+            }
+
+            let count = self.subscription_count();
+
+            output.extend(RespSerializer::array(vec![
+                RespSerializer::bulk_string(b"subscribe"),
+                RespSerializer::bulk_string(channel.as_bytes()),
+                RespSerializer::integer(count as i64),
+            ]));
+        }
+
+        output
+    }
+
+    async fn unsubscribe_channels(&mut self, channels: Vec<String>) -> Vec<u8> {
+        let channels = if channels.is_empty() {
+            let mut existing: Vec<String> = self.channel_subscriptions.keys().cloned().collect();
+
+            existing.sort();
+
+            if existing.is_empty() {
+                return RespSerializer::array(vec![
+                    RespSerializer::bulk_string(b"unsubscribe"),
+                    RespSerializer::null_bulk_string(),
+                    RespSerializer::integer(self.subscription_count() as i64),
+                ]);
+            }
+
+            existing
+        } else {
+            channels
+        };
+
+        let mut output = Vec::new();
+
+        for channel in channels {
+            if let Some(task) = self.channel_subscriptions.remove(&channel) {
+                task.abort();
+                let _ = task.await;
+
+                self.db.cleanup_channel_subscription(&channel).await;
+            }
+
+            let count = self.subscription_count();
+
+            output.extend(RespSerializer::array(vec![
+                RespSerializer::bulk_string(b"unsubscribe"),
+                RespSerializer::bulk_string(channel.as_bytes()),
+                RespSerializer::integer(count as i64),
+            ]));
+        }
+
+        output
+    }
+
+    async fn subscribe_patterns(&mut self, patterns: Vec<String>) -> Vec<u8> {
+        let mut output = Vec::new();
+
+        for pattern in patterns {
+            if !self.pattern_subscriptions.contains_key(&pattern) {
+                let mut rx = self.db.subscribe_pattern(pattern.clone()).await;
+
+                let tx = self.pubsub_tx.clone();
+                let subscribed_pattern = pattern.clone();
+
+                let task = tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok((channel, message)) => {
+                                if tx
+                                    .send(PubSubEvent::PatternMessage {
+                                        pattern: subscribed_pattern.clone(),
+                                        channel,
+                                        message,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                self.pattern_subscriptions.insert(pattern.clone(), task);
+            }
+
+            let count = self.subscription_count();
+
+            output.extend(RespSerializer::array(vec![
+                RespSerializer::bulk_string(b"psubscribe"),
+                RespSerializer::bulk_string(pattern.as_bytes()),
+                RespSerializer::integer(count as i64),
+            ]));
+        }
+
+        output
+    }
+
+    async fn unsubscribe_patterns(&mut self, patterns: Vec<String>) -> Vec<u8> {
+        let patterns = if patterns.is_empty() {
+            let mut existing: Vec<String> = self.pattern_subscriptions.keys().cloned().collect();
+
+            existing.sort();
+
+            if existing.is_empty() {
+                return RespSerializer::array(vec![
+                    RespSerializer::bulk_string(b"punsubscribe"),
+                    RespSerializer::null_bulk_string(),
+                    RespSerializer::integer(self.subscription_count() as i64),
+                ]);
+            }
+
+            existing
+        } else {
+            patterns
+        };
+
+        let mut output = Vec::new();
+
+        for pattern in patterns {
+            if let Some(task) = self.pattern_subscriptions.remove(&pattern) {
+                task.abort();
+                let _ = task.await;
+
+                self.db.cleanup_pattern_subscription(&pattern).await;
+            }
+
+            let count = self.subscription_count();
+
+            output.extend(RespSerializer::array(vec![
+                RespSerializer::bulk_string(b"punsubscribe"),
+                RespSerializer::bulk_string(pattern.as_bytes()),
+                RespSerializer::integer(count as i64),
+            ]));
+        }
+
+        output
+    }
+
+    fn subscription_count(&self) -> usize {
+        self.channel_subscriptions.len() + self.pattern_subscriptions.len()
+    }
+
+    async fn cleanup_subscriptions(&mut self) {
+        let channels: Vec<String> = self.channel_subscriptions.keys().cloned().collect();
+
+        let patterns: Vec<String> = self.pattern_subscriptions.keys().cloned().collect();
+
+        let channel_tasks: Vec<_> = self.channel_subscriptions.drain().collect();
+
+        let pattern_tasks: Vec<_> = self.pattern_subscriptions.drain().collect();
+
+        for (_, task) in channel_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+
+        for (_, task) in pattern_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+
+        for channel in channels {
+            self.db.cleanup_channel_subscription(&channel).await;
+        }
+
+        for pattern in patterns {
+            self.db.cleanup_pattern_subscription(&pattern).await;
+        }
+    }
+
+    async fn write_pubsub_event(&mut self, event: PubSubEvent) -> Result<(), std::io::Error> {
+        let packet = match event {
+            PubSubEvent::Message { channel, message } => RespSerializer::array(vec![
+                RespSerializer::bulk_string(b"message"),
+                RespSerializer::bulk_string(channel.as_bytes()),
+                RespSerializer::bulk_string(&message),
+            ]),
+
+            PubSubEvent::PatternMessage {
+                pattern,
+                channel,
+                message,
+            } => RespSerializer::array(vec![
+                RespSerializer::bulk_string(b"pmessage"),
+                RespSerializer::bulk_string(pattern.as_bytes()),
+                RespSerializer::bulk_string(channel.as_bytes()),
+                RespSerializer::bulk_string(&message),
+            ]),
+        };
+
+        self.stream.write_all(&packet).await?;
+        self.stream.flush().await?;
+
+        Ok(())
     }
 
     async fn execute_command(&mut self, cmd: Commands) -> Vec<u8> {
@@ -333,33 +608,17 @@ impl Handler {
 
             // --- Realtime Messaging Pub/Sub ---
             Commands::Publish { channel, message } => {
-                let subscriber_count = self.db.publish(&channel, message).await;
-                RespSerializer::integer(subscriber_count as i64)
+                let count = self.db.publish(&channel, message).await;
+                RespSerializer::integer(count as i64)
             }
-            Commands::Subscribe { channel } => {
-                // 1. Generate the confirmation array packet
-                let setup_reply = RespSerializer::array(vec![
-                    RespSerializer::bulk_string(b"subscribe"),
-                    RespSerializer::bulk_string(channel.as_bytes()),
-                    RespSerializer::integer(1),
-                ]);
 
-                // 2. Write it back to the socket immediately before entering the loop
-                if let Err(e) = self.stream.write_all(&setup_reply).await {
-                    return RespSerializer::error(&format!(
-                        "ERR Subscription Write Failure: {}",
-                        e
-                    ));
-                }
-                let _ = self.stream.flush().await;
+            Commands::Subscribe { channels } => self.subscribe_channels(channels).await,
 
-                // 3. Drop into a one-way reactive broadcast stream reader loop
-                if let Err(e) = self.handle_subscribe_stream_only(channel).await {
-                    eprintln!("PubSub Stream Error: {}", e);
-                }
+            Commands::Unsubscribe { channels } => self.unsubscribe_channels(channels).await,
 
-                vec![] // Return empty to signal the command execution is done
-            }
+            Commands::PSubscribe { patterns } => self.subscribe_patterns(patterns).await,
+
+            Commands::PUnsubscribe { patterns } => self.unsubscribe_patterns(patterns).await,
 
             Commands::PExpire { key, milliseconds } => {
                 let result = self.db.pexpire(&key, milliseconds).await;
@@ -417,39 +676,5 @@ impl Handler {
         } else {
             RespSerializer::array(vec![])
         }
-    }
-
-    async fn handle_subscribe_stream_only(
-        &mut self,
-        channel: String,
-    ) -> Result<(), std::io::Error> {
-        let mut rx = self.db.subscribe(channel.clone()).await;
-
-        loop {
-            tokio::select! {
-                msg_res = rx.recv() => {
-                    match msg_res {
-                        Ok(msg_bytes) => {
-                            let broadcast_packet = RespSerializer::array(vec![
-                                RespSerializer::bulk_string(b"message"),
-                                RespSerializer::bulk_string(channel.as_bytes()),
-                                RespSerializer::bulk_string(&msg_bytes),
-                            ]);
-                            self.stream.write_all(&broadcast_packet).await?;
-                            self.stream.flush().await?;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(_) => break,
-                    }
-                }
-                _ = self.stream.readable() => {
-                    let mut probe = [0u8; 1];
-                    if self.stream.try_read(&mut probe).is_ok() && probe[0] == 0 {
-                        break; // Client closed the connection
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }

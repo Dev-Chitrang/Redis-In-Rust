@@ -157,7 +157,19 @@ pub enum Commands {
         message: Bytes,
     },
     Subscribe {
-        channel: String,
+        channels: Vec<String>,
+    },
+
+    Unsubscribe {
+        channels: Vec<String>,
+    },
+
+    PSubscribe {
+        patterns: Vec<String>,
+    },
+
+    PUnsubscribe {
+        patterns: Vec<String>,
     },
 
     PExpire {
@@ -657,8 +669,35 @@ impl Commands {
             }
 
             "SUBSCRIBE" => {
-                let channel = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                Commands::Subscribe { channel }
+                let channels = args[1..]
+                    .iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+                Commands::Subscribe { channels }
+            }
+
+            "UNSUBSCRIBE" => {
+                let channels = args[1..]
+                    .iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+                Commands::Unsubscribe { channels }
+            }
+
+            "PSUBSCRIBE" => {
+                let patterns = args[1..]
+                    .iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+                Commands::PSubscribe { patterns }
+            }
+
+            "PUNSUBSCRIBE" => {
+                let patterns = args[1..]
+                    .iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+                Commands::PUnsubscribe { patterns }
             }
 
             _ => Commands::Unknown(command_verb),
@@ -780,9 +819,7 @@ fn validate_command_args(command: &str, argc: usize) -> Result<(), String> {
 
         // Exactly two arguments after the command
         "EXPIRE" | "PEXPIRE" | "SETNX" | "INCRBY" | "DECRBY" | "HGET" | "HDEL" | "SREM"
-        | "SISMEMBER" | "ZREM" | "PUBLISH" => argc == 3,
-
-        "SUBSCRIBE" => argc == 2,
+        | "SISMEMBER" | "ZREM" => argc == 3,
 
         "SET" => argc >= 3,
 
@@ -795,6 +832,10 @@ fn validate_command_args(command: &str, argc: usize) -> Result<(), String> {
         "ZRANGE" | "ZREVRANGE" => argc == 4 || (argc == 5 && argc > 1),
 
         "MSET" => argc >= 3 && argc % 2 == 1,
+
+        "PUBLISH" => argc == 3,
+        "SUBSCRIBE" | "PSUBSCRIBE" => argc >= 2,
+        "UNSUBSCRIBE" | "PUNSUBSCRIBE" => argc >= 1,
 
         // Commands that accept an optional WITHSCORES argument
         _ => true,

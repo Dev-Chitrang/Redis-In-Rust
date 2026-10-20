@@ -678,6 +678,264 @@ def test_sharded_key_operations():
         f"(expected {expected} per key, got {results})",
     )
 
+def test_pubsub_phase3():
+    print("\n=== PHASE 3: PUB/SUB ===")
+
+    client = redis.Redis(
+        host=HOST,
+        port=PORT,
+        decode_responses=True,
+        protocol=2,
+        socket_timeout=5,
+    )
+
+    pubsub = client.pubsub()
+
+    try:
+        # Multiple channel subscriptions.
+        pubsub.subscribe(
+            "phase3:channel:one",
+            "phase3:channel:two",
+        )
+
+        acknowledgements = []
+
+        deadline = time.monotonic() + 3
+
+        while len(acknowledgements) < 2 and time.monotonic() < deadline:
+            message = pubsub.get_message(timeout=0.2)
+
+            if message and message["type"] == "subscribe":
+                acknowledgements.append(message)
+
+        check(
+            "SUBSCRIBE supports multiple channels",
+            len(acknowledgements) == 2
+            and {m["channel"] for m in acknowledgements}
+                == {"phase3:channel:one", "phase3:channel:two"},
+        )
+
+        check(
+            "SUBSCRIBE acknowledgement counts",
+            sorted(m["data"] for m in acknowledgements) == [1, 2],
+        )
+
+        # Direct-channel message.
+        receivers = client.publish(
+            "phase3:channel:one",
+            "direct-message",
+        )
+
+        message = None
+        deadline = time.monotonic() + 3
+
+        while time.monotonic() < deadline:
+            candidate = pubsub.get_message(timeout=0.2)
+
+            if candidate and candidate["type"] == "message":
+                message = candidate
+                break
+
+        check(
+            "Direct channel delivery",
+            receivers == 1
+            and message is not None
+            and message["channel"] == "phase3:channel:one"
+            and message["data"] == "direct-message",
+        )
+
+        # Unsubscribe from one channel.
+        pubsub.unsubscribe("phase3:channel:one")
+
+        acknowledgement = None
+        deadline = time.monotonic() + 3
+
+        while time.monotonic() < deadline:
+            candidate = pubsub.get_message(timeout=0.2)
+
+            if candidate and candidate["type"] == "unsubscribe":
+                acknowledgement = candidate
+                break
+
+        check(
+            "UNSUBSCRIBE removes one channel",
+            acknowledgement is not None
+            and acknowledgement["channel"] == "phase3:channel:one"
+            and acknowledgement["data"] == 1,
+        )
+
+        check(
+            "Unsubscribed channel no longer receives messages",
+            client.publish(
+                "phase3:channel:one",
+                "should-not-be-delivered",
+            ) == 0,
+        )
+
+        # Multiple pattern subscriptions.
+        pubsub.psubscribe(
+            "phase3:orders:*",
+            "phase3:users:?",
+        )
+
+        pattern_acks = []
+        deadline = time.monotonic() + 3
+
+        while len(pattern_acks) < 2 and time.monotonic() < deadline:
+            candidate = pubsub.get_message(timeout=0.2)
+
+            if candidate and candidate["type"] == "psubscribe":
+                pattern_acks.append(candidate)
+
+        check(
+            "PSUBSCRIBE supports multiple patterns",
+            len(pattern_acks) == 2
+            and {m["channel"] for m in pattern_acks}
+                == {"phase3:orders:*", "phase3:users:?"},
+        )
+
+        check(
+            "Pattern subscription acknowledgement counts",
+            sorted(m["data"] for m in pattern_acks) == [2, 3],
+        )
+
+        # Publish a matching pattern message.
+        receivers = client.publish(
+            "phase3:orders:123",
+            "order-created",
+        )
+
+        message = None
+        deadline = time.monotonic() + 3
+
+        while time.monotonic() < deadline:
+            candidate = pubsub.get_message(timeout=0.2)
+
+            if candidate and candidate["type"] == "pmessage":
+                message = candidate
+                break
+
+        check(
+            "PSUBSCRIBE wildcard delivery",
+            receivers == 1
+            and message is not None
+            and message["pattern"] == "phase3:orders:*"
+            and message["channel"] == "phase3:orders:123"
+            and message["data"] == "order-created",
+        )
+
+        # Test question-mark matching.
+        receivers = client.publish(
+            "phase3:users:A",
+            "user-created",
+        )
+
+        message = None
+        deadline = time.monotonic() + 3
+
+        while time.monotonic() < deadline:
+            candidate = pubsub.get_message(timeout=0.2)
+
+            if candidate and candidate["type"] == "pmessage":
+                message = candidate
+                break
+
+        check(
+            "Pattern question-mark matching",
+            receivers == 1
+            and message is not None
+            and message["pattern"] == "phase3:users:?"
+            and message["channel"] == "phase3:users:A",
+        )
+
+        # Unsubscribe from all patterns.
+        pubsub.punsubscribe()
+
+        pattern_unsub_acks = []
+        deadline = time.monotonic() + 3
+
+        while (
+            len(pattern_unsub_acks) < 2
+            and time.monotonic() < deadline
+        ):
+            candidate = pubsub.get_message(timeout=0.2)
+
+            if candidate and candidate["type"] == "punsubscribe":
+                pattern_unsub_acks.append(candidate)
+
+        check(
+            "PUNSUBSCRIBE removes all patterns",
+            len(pattern_unsub_acks) == 2
+            and sorted(m["data"] for m in pattern_unsub_acks) == [1, 2],
+        )
+
+        # Remove the remaining direct subscription.
+        pubsub.unsubscribe()
+
+        final_ack = None
+        deadline = time.monotonic() + 3
+
+        while time.monotonic() < deadline:
+            candidate = pubsub.get_message(timeout=0.2)
+
+            if candidate and candidate["type"] == "unsubscribe":
+                final_ack = candidate
+
+        check(
+            "UNSUBSCRIBE removes all remaining channels",
+            final_ack is not None
+            and final_ack["data"] == 0,
+        )
+
+    finally:
+        pubsub.close()
+        client.close()
+
+    # Disconnect cleanup.
+    disconnect_client = redis.Redis(
+        host=HOST,
+        port=PORT,
+        decode_responses=True,
+        protocol=2,
+        socket_timeout=5,
+    )
+
+    disconnect_pubsub = disconnect_client.pubsub()
+
+    try:
+        disconnect_pubsub.subscribe("phase3:disconnect")
+        acknowledgement = disconnect_pubsub.get_message(timeout=3)
+
+        check(
+            "Disconnect cleanup setup",
+            acknowledgement is not None
+            and acknowledgement["type"] == "subscribe",
+        )
+
+        disconnect_pubsub.close()
+
+        deadline = time.monotonic() + 3
+        receivers = 1
+
+        while time.monotonic() < deadline:
+            receivers = disconnect_client.publish(
+                "phase3:disconnect",
+                "cleanup-check",
+            )
+
+            if receivers == 0:
+                break
+
+            time.sleep(0.05)
+
+        check(
+            "Disconnected subscriber is cleaned up",
+            receivers == 0,
+        )
+
+    finally:
+        disconnect_pubsub.close()
+        disconnect_client.close()
 # --------------------------------------------------
 # Main
 # --------------------------------------------------
@@ -702,6 +960,7 @@ def run_tests(mode):
 
     try:
         test_functional()
+        test_pubsub_phase3()
         test_phase1()
         test_concurrency()
         test_atomicity()

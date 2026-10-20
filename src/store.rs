@@ -49,6 +49,7 @@ pub struct Db {
     pub shards: Vec<RwLock<HashMap<String, DbEntry>>>,
     pub operation_gate: RwLock<()>,
     pub pubsub: RwLock<HashMap<String, broadcast::Sender<Bytes>>>,
+    pub pattern_pubsub: RwLock<HashMap<String, broadcast::Sender<(String, Bytes)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +77,7 @@ impl SharedDb {
             shards,
             operation_gate: RwLock::new(()),
             pubsub: RwLock::new(HashMap::new()),
+            pattern_pubsub: RwLock::new(HashMap::new()),
         }))
     }
 
@@ -727,22 +729,79 @@ impl SharedDb {
     }
 
     // Pub-Sub engine
+
     pub async fn publish(&self, channel: &str, message: Bytes) -> usize {
-        let pubsub = self.0.pubsub.read().await;
-        if let Some(sender) = pubsub.get(channel) {
-            sender.send(message).unwrap_or(0)
-        } else {
-            0
+        let mut delivered = 0;
+
+        // Direct channel subscribers.
+        {
+            let pubsub = self.0.pubsub.read().await;
+
+            if let Some(sender) = pubsub.get(channel) {
+                delivered += sender.send(message.clone()).unwrap_or(0);
+            }
         }
+
+        // Pattern subscribers.
+        {
+            let patterns = self.0.pattern_pubsub.read().await;
+
+            for (pattern, sender) in patterns.iter() {
+                if glob_matches(pattern.as_bytes(), channel.as_bytes()) {
+                    delivered += sender
+                        .send((channel.to_string(), message.clone()))
+                        .unwrap_or(0);
+                }
+            }
+        }
+
+        delivered
     }
 
     pub async fn subscribe(&self, channel: String) -> broadcast::Receiver<Bytes> {
         let mut pubsub = self.0.pubsub.write().await;
+
         let sender = pubsub.entry(channel).or_insert_with(|| {
             let (tx, _) = broadcast::channel(1024);
             tx
         });
+
         sender.subscribe()
+    }
+
+    pub async fn subscribe_pattern(&self, pattern: String) -> broadcast::Receiver<(String, Bytes)> {
+        let mut patterns = self.0.pattern_pubsub.write().await;
+
+        let sender = patterns.entry(pattern).or_insert_with(|| {
+            let (tx, _) = broadcast::channel(1024);
+            tx
+        });
+
+        sender.subscribe()
+    }
+
+    pub async fn cleanup_channel_subscription(&self, channel: &str) {
+        let mut pubsub = self.0.pubsub.write().await;
+
+        let remove = pubsub
+            .get(channel)
+            .is_some_and(|sender| sender.receiver_count() == 0);
+
+        if remove {
+            pubsub.remove(channel);
+        }
+    }
+
+    pub async fn cleanup_pattern_subscription(&self, pattern: &str) {
+        let mut patterns = self.0.pattern_pubsub.write().await;
+
+        let remove = patterns
+            .get(pattern)
+            .is_some_and(|sender| sender.receiver_count() == 0);
+
+        if remove {
+            patterns.remove(pattern);
+        }
     }
 
     pub async fn remove_expired(&self) -> usize {
@@ -794,4 +853,112 @@ impl SharedDb {
 
         0
     }
+}
+
+fn glob_matches(pattern: &[u8], text: &[u8]) -> bool {
+    fn class_matches(pattern: &[u8], start: usize, value: u8) -> Option<(bool, usize)> {
+        if pattern.get(start) != Some(&b'[') {
+            return None;
+        }
+
+        let mut i = start + 1;
+        let mut negated = false;
+
+        if pattern.get(i) == Some(&b'^') {
+            negated = true;
+            i += 1;
+        }
+
+        let mut matched = false;
+        let mut has_item = false;
+
+        while i < pattern.len() && pattern[i] != b']' {
+            let first = pattern[i];
+            has_item = true;
+
+            if i + 2 < pattern.len() && pattern[i + 1] == b'-' && pattern[i + 2] != b']' {
+                let last = pattern[i + 2];
+
+                if first <= value && value <= last {
+                    matched = true;
+                }
+
+                i += 3;
+            } else {
+                if first == value {
+                    matched = true;
+                }
+
+                i += 1;
+            }
+        }
+
+        if i >= pattern.len() || !has_item {
+            return None;
+        }
+
+        Some((matched != negated, i + 1))
+    }
+
+    fn matches(
+        pattern: &[u8],
+        text: &[u8],
+        p: usize,
+        t: usize,
+        memo: &mut [Vec<Option<bool>>],
+    ) -> bool {
+        if let Some(result) = memo[p][t] {
+            return result;
+        }
+
+        let result = if p == pattern.len() {
+            t == text.len()
+        } else {
+            match pattern[p] {
+                b'*' => {
+                    // Collapse consecutive stars.
+                    let mut next = p + 1;
+
+                    while next < pattern.len() && pattern[next] == b'*' {
+                        next += 1;
+                    }
+
+                    (t..=text.len()).any(|index| matches(pattern, text, next, index, memo))
+                }
+
+                b'?' => t < text.len() && matches(pattern, text, p + 1, t + 1, memo),
+
+                b'\\' if p + 1 < pattern.len() => {
+                    t < text.len()
+                        && pattern[p + 1] == text[t]
+                        && matches(pattern, text, p + 2, t + 1, memo)
+                }
+
+                b'[' => {
+                    if let Some((matched, next)) =
+                        class_matches(pattern, p, text.get(t).copied().unwrap_or(0))
+                    {
+                        t < text.len() && matched && matches(pattern, text, next, t + 1, memo)
+                    } else {
+                        t < text.len()
+                            && pattern[p] == text[t]
+                            && matches(pattern, text, p + 1, t + 1, memo)
+                    }
+                }
+
+                literal => {
+                    t < text.len()
+                        && literal == text[t]
+                        && matches(pattern, text, p + 1, t + 1, memo)
+                }
+            }
+        };
+
+        memo[p][t] = Some(result);
+        result
+    }
+
+    let mut memo = vec![vec![None; text.len() + 1]; pattern.len() + 1];
+
+    matches(pattern, text, 0, 0, &mut memo)
 }
