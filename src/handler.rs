@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub struct Handler {
@@ -53,20 +53,33 @@ impl Handler {
         }
     }
 
-    pub async fn run(mut self) -> Result<(), std::io::Error> {
-        let result = self.run_loop().await;
+    pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<(), std::io::Error> {
+        let result = self.run_loop(&mut shutdown).await;
 
-        // Cleanup runs on disconnect and on connection errors.
+        // Always clean up Pub/Sub tasks on normal exit,
+        // connection errors, or a graceful shutdown signal.
         self.cleanup_subscriptions().await;
+
+        // Close the TCP connection.
+        let _ = self.stream.shutdown().await;
 
         result
     }
 
-    async fn run_loop(&mut self) -> Result<(), std::io::Error> {
+    async fn run_loop(
+        &mut self,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<(), std::io::Error> {
         let mut read_buf = [0u8; 1024];
 
         loop {
             tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        println!("Connection received shutdown signal.");
+                        return Ok(());
+                    }
+                }
                 read_result = self.stream.read(&mut read_buf) => {
                     let bytes_read = read_result?;
 
