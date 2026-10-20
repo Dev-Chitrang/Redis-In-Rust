@@ -592,8 +592,8 @@ impl Handler {
             }
 
             // --- Sorted Sets (ZSets) ---
-            Commands::ZAdd { key, score, value } => {
-                let res = self.db.zadd(key, score, value).await;
+            Commands::ZAdd { key, members } => {
+                let res = self.db.zadd_many(key, members).await;
                 RespSerializer::integer(res as i64)
             }
             Commands::ZRem { key, value } => {

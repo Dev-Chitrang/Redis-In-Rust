@@ -131,8 +131,7 @@ pub enum Commands {
     // Sorted Sets
     ZAdd {
         key: String,
-        score: i64,
-        value: Bytes,
+        members: Vec<(f64, Bytes)>,
     },
     ZRem {
         key: String,
@@ -347,7 +346,7 @@ impl Commands {
             "PEXPIRE" => {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let milliseconds_str = String::from_utf8(args.get(2)?.to_vec()).ok()?;
-                let milliseconds = milliseconds_str.trim().parse::<u64>().ok()? / 1000;
+                let milliseconds = milliseconds_str.trim().parse::<u64>().ok()?;
                 Commands::PExpire { key, milliseconds }
             }
 
@@ -606,14 +605,32 @@ impl Commands {
             }
 
             "ZADD" => {
-                let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let score = std::str::from_utf8(&args.get(2)?)
-                    .ok()?
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
-                let value = args.get(3)?.clone();
-                Commands::ZAdd { key, score, value }
+                let key = String::from_utf8_lossy(&args[1]).into_owned();
+
+                let mut members = Vec::new();
+                let mut i = 2;
+
+                while i < args.len() {
+                    let score_str = std::str::from_utf8(&args[i]).ok()?;
+                    let mut score = score_str.trim().parse::<f64>().ok()?;
+
+                    // NaN cannot be used as a sorted-set score.
+                    if score.is_nan() {
+                        return None;
+                    }
+
+                    // Normalize negative zero.
+                    if score == 0.0 {
+                        score = 0.0;
+                    }
+
+                    let value = args.get(i + 1)?.clone();
+
+                    members.push((score, value));
+                    i += 2;
+                }
+
+                Commands::ZAdd { key, members }
             }
 
             "ZREM" => {
@@ -627,13 +644,13 @@ impl Commands {
                 let start = std::str::from_utf8(&args.get(2)?)
                     .ok()?
                     .trim()
-                    .parse()
-                    .unwrap_or(0);
+                    .parse::<i64>()
+                    .ok()?;
                 let end = std::str::from_utf8(&args.get(3)?)
                     .ok()?
                     .trim()
-                    .parse()
-                    .unwrap_or(0);
+                    .parse::<i64>()
+                    .ok()?;
                 let mut with_scores = false;
                 if let Some(arg4) = args.get(4) {
                     if std::str::from_utf8(arg4.as_ref())
@@ -827,7 +844,9 @@ fn validate_command_args(command: &str, argc: usize) -> Result<(), String> {
 
         "LPUSH" | "RPUSH" | "SADD" => argc >= 3,
 
-        "LRANGE" | "ZADD" | "SINTER" => argc == 4,
+        "LRANGE" | "SINTER" => argc == 4,
+
+        "ZADD" => argc >= 4 && argc % 2 == 0,
 
         "ZRANGE" | "ZREVRANGE" => argc == 4 || (argc == 5 && argc > 1),
 

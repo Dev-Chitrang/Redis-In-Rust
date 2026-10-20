@@ -936,6 +936,191 @@ def test_pubsub_phase3():
     finally:
         disconnect_pubsub.close()
         disconnect_client.close()
+
+def test_sorted_sets():
+    print("\n=== PHASE 5: SORTED SETS ===")
+
+    key = "phase5:leaderboard"
+    r.delete(key)
+
+    # Floating-point scores and initial insertion.
+    added = r.zadd(
+        key,
+        {
+            "alice": 10.5,
+            "bob": 20.75,
+            "charlie": 10.5,
+            "david": 5.25,
+        },
+    )
+
+    check("ZADD inserts all members", added == 4)
+
+    # Ascending score order, with lexicographical ordering
+    # when scores are equal.
+    check(
+        "Score ordering",
+        r.zrange(key, 0, -1) == [
+            "david",
+            "alice",
+            "charlie",
+            "bob",
+        ],
+    )
+
+    check(
+        "Floating-point scores",
+        r.zrange(key, 0, -1, withscores=True) == [
+            ("david", 5.25),
+            ("alice", 10.5),
+            ("charlie", 10.5),
+            ("bob", 20.75),
+        ],
+    )
+
+    # Reverse ordering.
+    check(
+        "Reverse score ordering",
+        r.zrevrange(key, 0, -1) == [
+            "bob",
+            "charlie",
+            "alice",
+            "david",
+        ],
+    )
+
+    # Negative indexes and rank boundaries.
+    check(
+        "Negative rank boundaries",
+        r.zrange(key, -2, -1) == ["charlie", "bob"],
+    )
+
+    check(
+        "Out-of-range ranks",
+        r.zrange(key, 10, 20) == [],
+    )
+
+    check(
+        "Start rank greater than end rank",
+        r.zrange(key, 3, 1) == [],
+    )
+
+    check(
+        "Negative start below range",
+        r.zrange(key, -20, 1) == ["david", "alice"],
+    )
+
+    # Updating a score should not create a duplicate member.
+    updated = r.zadd(key, {"alice": 30.125})
+
+    check(
+        "Score update does not increase member count",
+        updated == 0 and len(r.zrange(key, 0, -1)) == 4,
+    )
+
+    check(
+        "Updated member moves to correct position",
+        r.zrange(key, -1, -1, withscores=True)
+        == [("alice", 30.125)],
+    )
+
+    # Adding an existing member and a new member together.
+    added = r.zadd(
+        key,
+        {
+            "alice": 31.5,
+            "eve": 15.125,
+        },
+    )
+
+    check(
+        "Mixed update and insertion count",
+        added == 1 and len(r.zrange(key, 0, -1)) == 5,
+    )
+
+    check(
+        "Updated score changes ordering",
+        r.zrange(key, 0, -1)
+        == ["david", "charlie", "eve", "bob", "alice"],
+    )
+
+    # Remove and verify.
+    removed = r.zrem(key, "charlie")
+
+    check(
+        "ZREM removes member",
+        removed == 1 and "charlie" not in r.zrange(key, 0, -1),
+    )
+
+    check(
+        "ZREM missing member",
+        r.zrem(key, "missing-member") == 0,
+    )
+
+    # Updating the same member repeatedly must not duplicate it.
+    r.zadd(key, {"bob": 40.5})
+    r.zadd(key, {"bob": 41.5})
+
+    check(
+        "Repeated score updates",
+        len(r.zrange(key, 0, -1)) == 4
+        and ("bob", 41.5) in r.zrange(key, 0, -1, withscores=True),
+    )
+
+    # Equal-score ordering should remain deterministic.
+    r.delete(key)
+    r.zadd(key, {"zebra": 1.5, "apple": 1.5, "mango": 1.5})
+
+    check(
+        "Equal-score ordering",
+        r.zrange(key, 0, -1)
+        == ["apple", "mango", "zebra"],
+    )
+
+    check(
+        "Equal-score reverse ordering",
+        r.zrevrange(key, 0, -1)
+        == ["zebra", "mango", "apple"],
+    )
+
+    r.delete(key)
+
+def test_sorted_set_high_rank():
+    print("\n=== PHASE 5: HIGH-RANK LOOKUP ===")
+
+    key = "phase5:large-rank"
+    r.delete(key)
+
+    total = 4000
+    batch_size = 500
+
+    for start in range(0, total, batch_size):
+        members = {
+            f"member:{i:05d}": float(i)
+            for i in range(start, min(start + batch_size, total))
+        }
+
+        r.zadd(key, members)
+
+    check(
+        "Large sorted-set insertion",
+        len(r.zrange(key, 0, -1)) == total,
+    )
+
+    check(
+        "High-rank lookup",
+        r.zrange(key, total - 1, total - 1, withscores=True)
+        == [(f"member:{total - 1:05d}", float(total - 1))],
+    )
+
+    check(
+        "High-rank reverse lookup",
+        r.zrevrange(key, 0, 0, withscores=True)
+        == [(f"member:{total - 1:05d}", float(total - 1))],
+    )
+
+    r.delete(key)
+
 # --------------------------------------------------
 # Main
 # --------------------------------------------------
@@ -960,6 +1145,9 @@ def run_tests(mode):
 
     try:
         test_functional()
+        test_sorted_sets()
+        test_sorted_sets()
+        test_sorted_set_high_rank()
         test_pubsub_phase3()
         test_phase1()
         test_concurrency()

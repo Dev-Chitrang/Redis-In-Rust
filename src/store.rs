@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -8,18 +8,253 @@ use tokio::time::Instant;
 
 const SHARED_COUNT: usize = 64;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ZSetMember {
-    pub score: i64,
+    pub score: f64,
     pub value: Bytes,
 }
 
+type RankLink = Option<Box<RankNode>>;
+
+#[derive(Debug, Clone)]
+struct RankNode {
+    member: ZSetMember,
+    height: i32,
+    size: usize,
+    left: RankLink,
+    right: RankLink,
+}
+
+impl RankNode {
+    fn new(member: ZSetMember) -> Box<Self> {
+        Box::new(Self {
+            member,
+            height: 1,
+            size: 1,
+            left: None,
+            right: None,
+        })
+    }
+}
+
+fn height(node: &RankLink) -> i32 {
+    node.as_ref().map_or(0, |node| node.height)
+}
+
+fn subtree_size(node: &RankLink) -> usize {
+    node.as_ref().map_or(0, |node| node.size)
+}
+
+fn update_node(node: &mut Box<RankNode>) {
+    node.height = 1 + height(&node.left).max(height(&node.right));
+
+    node.size = 1 + subtree_size(&node.left) + subtree_size(&node.right);
+}
+
+fn rotate_right(mut root: Box<RankNode>) -> Box<RankNode> {
+    let mut new_root = root
+        .left
+        .take()
+        .expect("right rotation requires a left child");
+
+    root.left = new_root.right.take();
+
+    update_node(&mut root);
+
+    new_root.right = Some(root);
+
+    update_node(&mut new_root);
+
+    new_root
+}
+
+fn rotate_left(mut root: Box<RankNode>) -> Box<RankNode> {
+    let mut new_root = root
+        .right
+        .take()
+        .expect("left rotation requires a right child");
+
+    root.right = new_root.left.take();
+
+    update_node(&mut root);
+
+    new_root.left = Some(root);
+
+    update_node(&mut new_root);
+
+    new_root
+}
+
+fn balance_node(mut node: Box<RankNode>) -> Box<RankNode> {
+    update_node(&mut node);
+
+    let balance = height(&node.left) - height(&node.right);
+
+    // Left-heavy subtree.
+    if balance > 1 {
+        let left = node.left.as_ref().unwrap();
+
+        // Left-right case.
+        if height(&left.left) < height(&left.right) {
+            node.left = node.left.take().map(rotate_left);
+        }
+
+        return rotate_right(node);
+    }
+
+    // Right-heavy subtree.
+    if balance < -1 {
+        let right = node.right.as_ref().unwrap();
+
+        // Right-left case.
+        if height(&right.right) < height(&right.left) {
+            node.right = node.right.take().map(rotate_right);
+        }
+
+        return rotate_left(node);
+    }
+
+    node
+}
+
+fn insert_node(root: RankLink, member: ZSetMember) -> RankLink {
+    match root {
+        None => Some(RankNode::new(member)),
+
+        Some(mut node) => {
+            match member.cmp(&node.member) {
+                std::cmp::Ordering::Less => {
+                    node.left = insert_node(node.left.take(), member);
+                }
+
+                std::cmp::Ordering::Greater => {
+                    node.right = insert_node(node.right.take(), member);
+                }
+
+                std::cmp::Ordering::Equal => {
+                    node.member = member;
+                    return Some(node);
+                }
+            }
+
+            Some(balance_node(node))
+        }
+    }
+}
+
+fn take_min(mut node: Box<RankNode>) -> (RankLink, ZSetMember) {
+    match node.left.take() {
+        None => {
+            let right = node.right.take();
+
+            (right, node.member)
+        }
+
+        Some(left) => {
+            let (new_left, minimum) = take_min(left);
+
+            node.left = new_left;
+
+            (Some(balance_node(node)), minimum)
+        }
+    }
+}
+
+fn remove_node(root: RankLink, key: &ZSetMember) -> RankLink {
+    let mut node = root?;
+
+    match key.cmp(&node.member) {
+        std::cmp::Ordering::Less => {
+            node.left = remove_node(node.left.take(), key);
+        }
+
+        std::cmp::Ordering::Greater => {
+            node.right = remove_node(node.right.take(), key);
+        }
+
+        std::cmp::Ordering::Equal => {
+            if node.left.is_none() {
+                return node.right;
+            }
+
+            if node.right.is_none() {
+                return node.left;
+            }
+
+            let right = node.right.take().unwrap();
+
+            let (new_right, successor) = take_min(right);
+
+            node.member = successor;
+            node.right = new_right;
+        }
+    }
+
+    Some(balance_node(node))
+}
+
+fn select_by_rank(root: &RankLink, rank: usize) -> Option<&ZSetMember> {
+    let node = root.as_ref()?;
+
+    let left_size = subtree_size(&node.left);
+
+    if rank < left_size {
+        select_by_rank(&node.left, rank)
+    } else if rank == left_size {
+        Some(&node.member)
+    } else {
+        select_by_rank(&node.right, rank - left_size - 1)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SortedSet {
+    root: RankLink,
+    pub scores: HashMap<Bytes, f64>,
+}
+
+impl SortedSet {
+    pub fn new() -> Self {
+        Self {
+            root: None,
+            scores: HashMap::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        subtree_size(&self.root)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
+    }
+
+    pub fn insert_member(&mut self, member: ZSetMember) {
+        self.root = insert_node(self.root.take(), member);
+    }
+
+    pub fn remove_member(&mut self, member: &ZSetMember) {
+        self.root = remove_node(self.root.take(), member);
+    }
+
+    pub fn member_at_rank(&self, rank: usize) -> Option<&ZSetMember> {
+        select_by_rank(&self.root, rank)
+    }
+}
+
+impl PartialEq for ZSetMember {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.total_cmp(&other.score) == Ordering::Equal && self.value == other.value
+    }
+}
+
+impl Eq for ZSetMember {}
+
 impl Ord for ZSetMember {
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.score.cmp(&other.score) {
-            Ordering::Equal => self.value.cmp(&other.value),
-            other_ord => other_ord,
-        }
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.value.cmp(&other.value))
     }
 }
 
@@ -35,7 +270,7 @@ pub enum Value {
     Hash(HashMap<String, Bytes>),
     List(VecDeque<Bytes>),
     Set(HashSet<Bytes>),
-    SortedSet(BTreeSet<ZSetMember>),
+    SortedSet(SortedSet),
 }
 
 #[derive(Debug, Clone)]
@@ -647,23 +882,51 @@ impl SharedDb {
 
     // Sorted sets engine
 
-    pub async fn zadd(&self, key: String, score: i64, value: Bytes) -> usize {
+    pub async fn zadd(&self, key: String, score: f64, value: Bytes) -> usize {
+        self.zadd_many(key, vec![(score, value)]).await
+    }
+
+    pub async fn zadd_many(&self, key: String, members: Vec<(f64, Bytes)>) -> usize {
         let _gate = self.0.operation_gate.read().await;
+
         let mut entries = self.shard(&key).write().await;
+
         remove_if_expired(&mut entries, &key);
+
         let entry = entries.entry(key).or_insert(DbEntry {
-            value: Value::SortedSet(BTreeSet::new()),
+            value: Value::SortedSet(SortedSet::new()),
             expires_at: None,
         });
-        if let Value::SortedSet(ref mut zset) = entry.value {
-            zset.retain(|m| m.value != value);
-            return if zset.insert(ZSetMember { score, value }) {
-                1
+
+        let Value::SortedSet(zset) = &mut entry.value else {
+            return 0;
+        };
+
+        let mut added = 0;
+
+        for (score, value) in members {
+            // NaN is rejected by the command parser.
+            // Normalize negative zero for consistent ordering.
+            let score = if score == 0.0 { 0.0 } else { score };
+
+            let previous_score = zset.scores.insert(value.clone(), score);
+
+            if let Some(previous_score) = previous_score {
+                // Remove the old score-index entry.
+                zset.remove_member(&ZSetMember {
+                    score: previous_score,
+                    value: value.clone(),
+                });
             } else {
-                0
-            };
+                // Only a previously absent member increases the count.
+                added += 1;
+            }
+
+            // Insert the member using its updated score.
+            zset.insert_member(ZSetMember { score, value });
         }
-        0
+
+        added
     }
 
     pub async fn zrange(
@@ -674,60 +937,84 @@ impl SharedDb {
         reverse: bool,
     ) -> Option<Vec<ZSetMember>> {
         let _gate = self.0.operation_gate.read().await;
+
         let entries = self.shard(key).read().await;
-        if let Some(entry) = entries.get(key) {
-            if is_expired(entry) {
-                return None;
-            }
-            if let Value::SortedSet(ref zset) = entry.value {
-                let len = zset.len() as i64;
-                if len == 0 {
-                    return Some(vec![]);
-                }
 
-                let mut start_index = if start < 0 { len + start } else { start };
-                let mut stop_index = if end < 0 { len + end } else { end };
+        let entry = entries.get(key)?;
 
-                if start_index < 0 {
-                    start_index = 0;
-                }
-                if stop_index >= len {
-                    stop_index = len - 1;
-                }
-                if start_index > stop_index {
-                    return Some(vec![]);
-                };
+        if is_expired(entry) {
+            return None;
+        }
 
-                let mut members: Vec<ZSetMember> = zset.iter().cloned().collect();
-                if reverse {
-                    members.reverse();
-                }
-                return Some(
-                    members
-                        .into_iter()
-                        .skip(start_index as usize)
-                        .take((stop_index - start_index + 1) as usize)
-                        .collect(),
-                );
+        let Value::SortedSet(zset) = &entry.value else {
+            return None;
+        };
+
+        let len = zset.len() as i64;
+
+        if len == 0 {
+            return Some(Vec::new());
+        }
+
+        // Normalize negative ranks.
+        // A negative start below the valid range is clamped to zero.
+        let start_index = if start < 0 {
+            len.saturating_add(start).max(0)
+        } else {
+            start
+        };
+
+        let end_index = if end < 0 {
+            len.saturating_add(end)
+        } else {
+            end
+        };
+
+        if start_index >= len || end_index < 0 || start_index > end_index {
+            return Some(Vec::new());
+        }
+
+        let end_index = end_index.min(len - 1);
+
+        let mut result = Vec::with_capacity((end_index - start_index + 1) as usize);
+
+        for rank in start_index..=end_index {
+            let actual_rank = if reverse {
+                (len - 1 - rank) as usize
+            } else {
+                rank as usize
+            };
+
+            if let Some(member) = zset.member_at_rank(actual_rank) {
+                result.push(member.clone());
             }
         }
-        None
+
+        Some(result)
     }
 
     pub async fn zrem(&self, key: &str, value: &Bytes) -> usize {
         let _gate = self.0.operation_gate.read().await;
+
         let mut entries = self.shard(key).write().await;
+
         remove_if_expired(&mut entries, key);
+
         if let Some(entry) = entries.get_mut(key) {
-            if let Value::SortedSet(ref mut zset) = entry.value {
-                let before = zset.len();
-                zset.retain(|m| m.value != value);
-                return before - zset.len();
+            if let Value::SortedSet(zset) = &mut entry.value {
+                if let Some(score) = zset.scores.remove(value) {
+                    zset.remove_member(&ZSetMember {
+                        score,
+                        value: value.clone(),
+                    });
+
+                    return 1;
+                }
             }
         }
+
         0
     }
-
     // Pub-Sub engine
 
     pub async fn publish(&self, channel: &str, message: Bytes) -> usize {
