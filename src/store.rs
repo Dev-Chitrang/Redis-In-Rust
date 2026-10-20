@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, RwLockWriteGuard};
 use tokio::time::Instant;
 
 const SHARED_COUNT: usize = 64;
@@ -207,6 +207,24 @@ fn select_by_rank(root: &RankLink, rank: usize) -> Option<&ZSetMember> {
     }
 }
 
+fn rank_of(root: &RankLink, target: &ZSetMember) -> Option<usize> {
+    let mut node = root.as_ref();
+    let mut rank = 0;
+
+    while let Some(n) = node {
+        match target.cmp(&n.member) {
+            Ordering::Less => node = n.left.as_ref(),
+            Ordering::Greater => {
+                rank += subtree_size(&n.left) + 1;
+                node = n.right.as_ref();
+            }
+            Ordering::Equal => return Some(rank + subtree_size(&n.left)),
+        }
+    }
+
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct SortedSet {
     root: RankLink,
@@ -239,6 +257,16 @@ impl SortedSet {
 
     pub fn member_at_rank(&self, rank: usize) -> Option<&ZSetMember> {
         select_by_rank(&self.root, rank)
+    }
+    pub fn rank(&self, member: &Bytes) -> Option<usize> {
+        let score = *self.scores.get(member)?;
+
+        let target = ZSetMember {
+            score,
+            value: member.clone(),
+        };
+
+        rank_of(&self.root, &target)
     }
 }
 
@@ -273,6 +301,78 @@ pub enum Value {
     SortedSet(SortedSet),
 }
 
+pub const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+pub const NOT_INT: &str = "ERR value is not an integer or out of range";
+pub const OVERFLOW: &str = "ERR increment or decrement would overflow";
+
+pub type DbResult<T> = Result<T, &'static str>;
+
+impl Value {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::String(_) => "string",
+            Value::Hash(_) => "hash",
+            Value::List(_) => "list",
+            Value::Set(_) => "set",
+            Value::SortedSet(_) => "zset",
+        }
+    }
+
+    fn as_string(&self) -> DbResult<&Bytes> {
+        match self {
+            Value::String(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+    fn as_hash(&self) -> DbResult<&HashMap<String, Bytes>> {
+        match self {
+            Value::Hash(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+    fn as_hash_mut(&mut self) -> DbResult<&mut HashMap<String, Bytes>> {
+        match self {
+            Value::Hash(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+    fn as_list(&self) -> DbResult<&VecDeque<Bytes>> {
+        match self {
+            Value::List(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+    fn as_list_mut(&mut self) -> DbResult<&mut VecDeque<Bytes>> {
+        match self {
+            Value::List(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+    fn as_set(&self) -> DbResult<&HashSet<Bytes>> {
+        match self {
+            Value::Set(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+    fn as_set_mut(&mut self) -> DbResult<&mut HashSet<Bytes>> {
+        match self {
+            Value::Set(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+    fn as_zset(&self) -> DbResult<&SortedSet> {
+        match self {
+            Value::SortedSet(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+    fn as_zset_mut(&mut self) -> DbResult<&mut SortedSet> {
+        match self {
+            Value::SortedSet(v) => Ok(v),
+            _ => Err(WRONGTYPE),
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct DbEntry {
     pub value: Value,
@@ -282,7 +382,6 @@ pub struct DbEntry {
 #[derive(Debug)]
 pub struct Db {
     pub shards: Vec<RwLock<HashMap<String, DbEntry>>>,
-    pub operation_gate: RwLock<()>,
     pub pubsub: RwLock<HashMap<String, broadcast::Sender<Bytes>>>,
     pub pattern_pubsub: RwLock<HashMap<String, broadcast::Sender<(String, Bytes)>>>,
 }
@@ -303,6 +402,48 @@ fn remove_if_expired(entries: &mut HashMap<String, DbEntry>, key: &str) {
     }
 }
 
+fn live<'a>(entries: &'a HashMap<String, DbEntry>, key: &str) -> Option<&'a DbEntry> {
+    entries.get(key).filter(|entry| !is_expired(entry))
+}
+
+// Redis removes a collection key as soon as it becomes empty.
+fn drop_if_empty(entries: &mut HashMap<String, DbEntry>, key: &str) {
+    let empty = entries.get(key).is_some_and(|entry| match &entry.value {
+        Value::Hash(v) => v.is_empty(),
+        Value::List(v) => v.is_empty(),
+        Value::Set(v) => v.is_empty(),
+        Value::SortedSet(v) => v.is_empty(),
+        Value::String(_) => false,
+    });
+
+    if empty {
+        entries.remove(key);
+    }
+}
+
+pub fn key_hash(key: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+// Write guards for a set of shards, always acquired in ascending shard order.
+pub struct LockedShards<'a> {
+    guards: Vec<(usize, RwLockWriteGuard<'a, HashMap<String, DbEntry>>)>,
+}
+
+impl<'a> LockedShards<'a> {
+    fn map(&mut self, key: &str) -> &mut HashMap<String, DbEntry> {
+        let index = SharedDb::shard_index(key);
+        let pos = self
+            .guards
+            .binary_search_by_key(&index, |(i, _)| *i)
+            .expect("shard was not locked");
+
+        &mut self.guards[pos].1
+    }
+}
+
 impl SharedDb {
     pub fn new() -> Self {
         let shards = (0..SHARED_COUNT)
@@ -310,32 +451,51 @@ impl SharedDb {
             .collect();
         Self(Arc::new(Db {
             shards,
-            operation_gate: RwLock::new(()),
             pubsub: RwLock::new(HashMap::new()),
             pattern_pubsub: RwLock::new(HashMap::new()),
         }))
     }
 
     fn shard_index(key: &str) -> usize {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
+        (key_hash(key) as usize) % SHARED_COUNT
+    }
 
-        (hasher.finish() as usize) % SHARED_COUNT
+    // Lock only the shards these keys live in, in sorted order (no deadlock).
+    async fn lock_keys<'a>(&'a self, keys: &[String]) -> LockedShards<'a> {
+        let mut indexes: Vec<usize> = keys.iter().map(|k| Self::shard_index(k)).collect();
+        indexes.sort_unstable();
+        indexes.dedup();
+
+        let mut guards = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            guards.push((index, self.0.shards[index].write().await));
+        }
+
+        LockedShards { guards }
+    }
+
+    async fn lock_all(&self) -> LockedShards<'_> {
+        let mut guards = Vec::with_capacity(SHARED_COUNT);
+        for (index, shard) in self.0.shards.iter().enumerate() {
+            guards.push((index, shard.write().await));
+        }
+
+        LockedShards { guards }
     }
 
     fn shard(&self, key: &str) -> &RwLock<HashMap<String, DbEntry>> {
         &self.0.shards[Self::shard_index(key)]
     }
 
-    // Genral key operations
+    // General key operations
 
     pub async fn exists(&self, keys: &[String]) -> usize {
-        let _gate = self.0.operation_gate.write().await;
+        let mut shards = self.lock_keys(keys).await;
         let mut count = 0;
 
         for key in keys {
-            let mut entries = self.shard(key).write().await;
-            remove_if_expired(&mut entries, key);
+            let entries = shards.map(key);
+            remove_if_expired(entries, key);
 
             if entries.contains_key(key) {
                 count += 1;
@@ -346,12 +506,12 @@ impl SharedDb {
     }
 
     pub async fn del(&self, keys: &[String]) -> usize {
-        let _gate = self.0.operation_gate.write().await;
+        let mut shards = self.lock_keys(keys).await;
         let mut deleted = 0;
 
         for key in keys {
-            let mut entries = self.shard(&key).write().await;
-            remove_if_expired(&mut entries, key);
+            let entries = shards.map(key);
+            remove_if_expired(entries, key);
 
             if entries.remove(key).is_some() {
                 deleted += 1;
@@ -362,7 +522,6 @@ impl SharedDb {
     }
 
     pub async fn expire(&self, key: &str, seconds: u64) -> usize {
-        let _gate = self.0.operation_gate.read().await;
         let mut entries = self.shard(key).write().await;
         if let Some(entry) = entries.get_mut(key) {
             if let Some(exp) = entry.expires_at {
@@ -378,7 +537,6 @@ impl SharedDb {
     }
 
     pub async fn ttl(&self, key: &str) -> i64 {
-        let _gate = self.0.operation_gate.read().await;
         let mut entries = self.shard(key).write().await;
         if let Some(entry) = entries.get(key) {
             if let Some(exp) = entry.expires_at {
@@ -395,7 +553,6 @@ impl SharedDb {
     }
 
     pub async fn pttl(&self, key: &str) -> i64 {
-        let _gate = self.0.operation_gate.read().await;
         let mut entries = self.shard(key).write().await;
 
         match entries.get(key).map(|entry| entry.expires_at) {
@@ -416,39 +573,111 @@ impl SharedDb {
         }
     }
 
-    pub async fn scan(&self) -> Vec<String> {
-        let _gate = self.0.operation_gate.write().await;
-        let now = Instant::now();
-        let mut keys = Vec::new();
+    pub async fn type_of(&self, key: &str) -> &'static str {
+        let entries = self.shard(key).read().await;
 
-        for shard in &self.0.shards {
-            let mut entries = shard.write().await;
-            entries.retain(|key, entry| {
-                if let Some(expiration) = entry.expires_at {
-                    if now >= expiration {
-                        return false;
-                    }
+        live(&entries, key).map_or("none", |entry| entry.value.type_name())
+    }
+
+    pub async fn keys(&self, pattern: &str) -> Vec<String> {
+        let shards = self.lock_all().await;
+        let now = Instant::now();
+        let mut out = Vec::new();
+
+        for (_, entries) in shards.guards.iter() {
+            for (key, entry) in entries.iter() {
+                let alive = entry.expires_at.map_or(true, |exp| now < exp);
+
+                if alive && glob_matches(pattern.as_bytes(), key.as_bytes()) {
+                    out.push(key.clone());
                 }
-                keys.push(key.clone());
-                true
-            });
+            }
         }
-        keys
+
+        out
+    }
+
+    // Cursor = 64-bit key hash. Keys are visited in (hash, key) order, so a key
+    // that exists for the whole iteration is always returned exactly once,
+    // even while other keys are added or removed.
+    pub async fn scan(
+        &self,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> (u64, Vec<String>) {
+        let shards = self.lock_all().await;
+        let now = Instant::now();
+        let mut candidates: Vec<(u64, String)> = Vec::new();
+
+        for (_, entries) in shards.guards.iter() {
+            for (key, entry) in entries.iter() {
+                let alive = entry.expires_at.map_or(true, |exp| now < exp);
+                let hash = key_hash(key);
+
+                if alive && hash >= cursor {
+                    candidates.push((hash, key.clone()));
+                }
+            }
+        }
+
+        drop(shards);
+        candidates.sort();
+
+        let mut end = count.max(1).min(candidates.len());
+
+        // Never split keys that share one hash across two pages.
+        while end > 0 && end < candidates.len() && candidates[end].0 == candidates[end - 1].0 {
+            end += 1;
+        }
+
+        let next = if end >= candidates.len() {
+            0
+        } else {
+            candidates[end - 1].0 + 1
+        };
+
+        let keys = candidates[..end]
+            .iter()
+            .filter(|(_, key)| pattern.map_or(true, |p| glob_matches(p.as_bytes(), key.as_bytes())))
+            .map(|(_, key)| key.clone())
+            .collect();
+
+        (next, keys)
     }
 
     pub async fn flushall(&self) {
-        let _gate = self.0.operation_gate.write().await;
+        let mut shards = self.lock_all().await;
 
-        for shard in &self.0.shards {
-            let mut entries = shard.write().await;
+        for (_, entries) in shards.guards.iter_mut() {
             entries.clear();
         }
+    }
+
+    // Consistent copy of the whole DB for AOF rewrite: (key, value, remaining ms).
+    pub async fn snapshot(&self) -> Vec<(String, Value, Option<u64>)> {
+        let shards = self.lock_all().await;
+        let now = Instant::now();
+        let mut out = Vec::new();
+
+        for (_, entries) in shards.guards.iter() {
+            for (key, entry) in entries.iter() {
+                let ttl_ms = match entry.expires_at {
+                    Some(exp) if now >= exp => continue,
+                    Some(exp) => Some((exp - now).as_millis() as u64),
+                    None => None,
+                };
+
+                out.push((key.clone(), entry.value.clone(), ttl_ms));
+            }
+        }
+
+        out
     }
 
     // Strings and numeric operations
 
     pub async fn set(&self, key: String, value: Bytes) {
-        let _gate = self.0.operation_gate.read().await;
         let mut entries = self.shard(&key).write().await;
         entries.insert(
             key,
@@ -459,6 +688,39 @@ impl SharedDb {
         );
     }
 
+    // Atomic across every key it touches.
+    pub async fn mset(&self, keys: Vec<String>, values: Vec<Bytes>) {
+        let mut shards = self.lock_keys(&keys).await;
+
+        for (key, value) in keys.into_iter().zip(values) {
+            shards.map(&key).insert(
+                key,
+                DbEntry {
+                    value: Value::String(value),
+                    expires_at: None,
+                },
+            );
+        }
+    }
+
+    pub async fn mget(&self, keys: &[String]) -> Vec<Option<Bytes>> {
+        let mut shards = self.lock_keys(keys).await;
+        let mut out = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            let entries = shards.map(key);
+            remove_if_expired(entries, key);
+
+            // Like Redis: wrong type reads as nil inside MGET.
+            out.push(match entries.get(key).map(|e| &e.value) {
+                Some(Value::String(bytes)) => Some(bytes.clone()),
+                _ => None,
+            });
+        }
+
+        out
+    }
+
     pub async fn set_with_options(
         &self,
         key: String,
@@ -467,7 +729,6 @@ impl SharedDb {
         nx: bool,
         xx: bool,
     ) -> bool {
-        let _gate = self.0.operation_gate.read().await;
         let mut entries = self.shard(&key).write().await;
 
         remove_if_expired(&mut entries, &key);
@@ -494,25 +755,16 @@ impl SharedDb {
         true
     }
 
-    pub async fn get(&self, key: &str) -> Option<Bytes> {
-        let _gate = self.0.operation_gate.read().await;
-        let mut entries = self.shard(key).write().await;
-        if let Some(entry) = entries.get(key) {
-            if let Some(exp) = entry.expires_at {
-                if Instant::now() >= exp {
-                    entries.remove(key);
-                    return None;
-                }
-            }
-            if let Value::String(ref val) = &entry.value {
-                return Some(val.clone());
-            }
+    pub async fn get(&self, key: &str) -> DbResult<Option<Bytes>> {
+        let entries = self.shard(key).read().await;
+
+        match live(&entries, key) {
+            None => Ok(None),
+            Some(entry) => Ok(Some(entry.value.as_string()?.clone())),
         }
-        None
     }
 
     pub async fn setnx(&self, key: String, value: Bytes) -> usize {
-        let _gate = self.0.operation_gate.read().await;
         let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
         if entries.contains_key(&key) {
@@ -528,379 +780,308 @@ impl SharedDb {
         1
     }
 
-    pub async fn incrby(&self, key: String, amount: i64) -> Result<i64, &'static str> {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn incrby(&self, key: String, amount: i64) -> DbResult<i64> {
         let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
-        let entry = entries.entry(key).or_insert(DbEntry {
-            value: Value::String(Bytes::from("0")),
+
+        let entry = entries.entry(key).or_insert_with(|| DbEntry {
+            value: Value::String(Bytes::from_static(b"0")),
             expires_at: None,
         });
 
-        if let Value::String(ref mut b) = entry.value {
-            let s = std::str::from_utf8(b)
-                .map_err(|_| "ERR value is not an integer or out of range")?;
-            let mut val: i64 = s
-                .trim()
-                .parse()
-                .map_err(|_| "ERR value is not an integer or out of range")?;
-            val += amount;
-            *b = Bytes::from(val.to_string());
-            return Ok(val);
-        }
-        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+        let current = entry.value.as_string()?;
+
+        let value: i64 = std::str::from_utf8(current)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(NOT_INT)?;
+
+        let updated = value.checked_add(amount).ok_or(OVERFLOW)?;
+
+        entry.value = Value::String(Bytes::from(updated.to_string()));
+
+        Ok(updated)
     }
 
     // Hashes Engine
 
-    pub async fn hset(&self, key: String, field: String, value: Bytes) -> usize {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn hset_many(&self, key: String, fields: Vec<(String, Bytes)>) -> DbResult<usize> {
         let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
-        let entry = entries.entry(key).or_insert(DbEntry {
+
+        let entry = entries.entry(key).or_insert_with(|| DbEntry {
             value: Value::Hash(HashMap::new()),
             expires_at: None,
         });
 
-        if let Value::Hash(ref mut map) = entry.value {
-            return if map.insert(field, value).is_none() {
-                1
-            } else {
-                0
-            };
-        }
-        0
-    }
+        let map = entry.value.as_hash_mut()?;
+        let mut added = 0;
 
-    pub async fn hset_many(&self, key: String, fields: Vec<(String, Bytes)>) -> usize {
-        let _gate = self.0.operation_gate.read().await;
-        let mut entries = self.shard(&key).write().await;
-        remove_if_expired(&mut entries, &key);
-        let entry = entries.entry(key).or_insert(DbEntry {
-            value: Value::Hash(HashMap::new()),
-            expires_at: None,
-        });
-
-        if let Value::Hash(ref mut map) = entry.value {
-            let mut added = 0;
-
-            for (field, value) in fields {
-                if map.insert(field, value).is_none() {
-                    added += 1;
-                }
+        for (field, value) in fields {
+            if map.insert(field, value).is_none() {
+                added += 1;
             }
-
-            added
-        } else {
-            0
         }
+
+        Ok(added)
     }
 
-    pub async fn hget(&self, key: &str, field: &str) -> Option<Bytes> {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn hget(&self, key: &str, field: &str) -> DbResult<Option<Bytes>> {
         let entries = self.shard(key).read().await;
-        if let Some(entry) = entries.get(key) {
-            if is_expired(entry) {
-                return None;
-            }
-            if let Value::Hash(ref map) = entry.value {
-                return map.get(field).cloned();
-            }
+
+        match live(&entries, key) {
+            None => Ok(None),
+            Some(entry) => Ok(entry.value.as_hash()?.get(field).cloned()),
         }
-        None
     }
 
-    pub async fn hgetall(&self, key: &str) -> Option<Vec<(String, Bytes)>> {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn hgetall(&self, key: &str) -> DbResult<Vec<(String, Bytes)>> {
         let entries = self.shard(key).read().await;
-        if let Some(entry) = entries.get(key) {
-            if is_expired(entry) {
-                return None;
-            }
-            if let Value::Hash(ref map) = entry.value {
-                return Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
-            }
+
+        match live(&entries, key) {
+            None => Ok(Vec::new()),
+            Some(entry) => Ok(entry
+                .value
+                .as_hash()?
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()),
         }
-        None
     }
 
-    pub async fn hdel(&self, key: &str, field: &str) -> usize {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn hdel(&self, key: &str, fields: &[String]) -> DbResult<usize> {
         let mut entries = self.shard(key).write().await;
         remove_if_expired(&mut entries, key);
-        if let Some(entry) = entries.get_mut(key) {
-            if let Value::Hash(ref mut map) = entry.value {
-                return map.remove(field).map(|_| 1).unwrap_or(0);
-            }
-        }
-        0
+
+        let Some(entry) = entries.get_mut(key) else {
+            return Ok(0);
+        };
+
+        let map = entry.value.as_hash_mut()?;
+        let removed = fields
+            .iter()
+            .filter(|f| map.remove(f.as_str()).is_some())
+            .count();
+
+        drop_if_empty(&mut entries, key);
+
+        Ok(removed)
     }
 
-    pub async fn hkeys(&self, key: &str) -> Option<Vec<String>> {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn hkeys(&self, key: &str) -> DbResult<Vec<String>> {
         let entries = self.shard(key).read().await;
-        if let Some(entry) = entries.get(key) {
-            if is_expired(entry) {
-                return None;
-            }
-            if let Value::Hash(ref map) = entry.value {
-                return Some(map.keys().cloned().collect());
-            }
+
+        match live(&entries, key) {
+            None => Ok(Vec::new()),
+            Some(entry) => Ok(entry.value.as_hash()?.keys().cloned().collect()),
         }
-        None
     }
 
     // List engine
-    pub async fn push_list(&self, key: String, value: Bytes, front: bool) -> usize {
-        let _gate = self.0.operation_gate.read().await;
-        let mut entries = self.shard(&key).write().await;
-        remove_if_expired(&mut entries, &key);
-        let entry = entries.entry(key).or_insert(DbEntry {
-            value: Value::List(VecDeque::new()),
-            expires_at: None,
-        });
-
-        if let Value::List(ref mut deque) = entry.value {
-            if front {
-                deque.push_front(value);
-            } else {
-                deque.push_back(value);
-            }
-            return deque.len();
-        }
-        0
-    }
 
     pub async fn push_list_many(
         &self,
         key: String,
         values: Vec<Bytes>,
         front: bool,
-    ) -> Result<usize, &'static str> {
-        let _gate = self.0.operation_gate.read().await;
+    ) -> DbResult<usize> {
         let mut entries = self.shard(&key).write().await;
 
         remove_if_expired(&mut entries, &key);
 
-        let entry = entries.entry(key).or_insert(DbEntry {
+        let entry = entries.entry(key).or_insert_with(|| DbEntry {
             value: Value::List(VecDeque::new()),
             expires_at: None,
         });
 
-        if let Value::List(ref mut deque) = entry.value {
-            for value in values {
-                if front {
-                    deque.push_front(value);
-                } else {
-                    deque.push_back(value);
-                }
-            }
+        let deque = entry.value.as_list_mut()?;
 
-            Ok(deque.len())
-        } else {
-            Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+        for value in values {
+            if front {
+                deque.push_front(value);
+            } else {
+                deque.push_back(value);
+            }
         }
+
+        Ok(deque.len())
     }
 
-    pub async fn pop_list(&self, key: &str, front: bool) -> Option<Bytes> {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn pop_list(&self, key: &str, front: bool) -> DbResult<Option<Bytes>> {
         let mut entries = self.shard(key).write().await;
         remove_if_expired(&mut entries, key);
-        if let Some(entry) = entries.get_mut(key) {
-            if let Value::List(ref mut deque) = entry.value {
-                return if front {
-                    deque.pop_front()
-                } else {
-                    deque.pop_back()
-                };
-            }
-        }
-        None
+
+        let Some(entry) = entries.get_mut(key) else {
+            return Ok(None);
+        };
+
+        let deque = entry.value.as_list_mut()?;
+
+        let popped = if front {
+            deque.pop_front()
+        } else {
+            deque.pop_back()
+        };
+
+        drop_if_empty(&mut entries, key);
+
+        Ok(popped)
     }
 
-    pub async fn lrange(&self, key: &str, start: i64, stop: i64) -> Option<Vec<Bytes>> {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn lrange(&self, key: &str, start: i64, stop: i64) -> DbResult<Vec<Bytes>> {
         let entries = self.shard(key).read().await;
-        if let Some(entry) = entries.get(key) {
-            if is_expired(entry) {
-                return None;
-            }
-            if let Value::List(ref deque) = entry.value {
-                let len = deque.len() as i64;
-                if len == 0 {
-                    return Some(vec![]);
-                }
-                let mut start_idx = if start < 0 { len + start } else { start };
-                let mut stop_idx = if stop < 0 { len + stop } else { stop };
 
-                if start_idx < 0 {
-                    start_idx = 0;
-                }
-                if stop_idx >= len {
-                    stop_idx = len - 1;
-                }
-                if start_idx > stop_idx {
-                    return Some(vec![]);
-                };
+        let Some(entry) = live(&entries, key) else {
+            return Ok(Vec::new());
+        };
 
-                return Some(
-                    deque
-                        .iter()
-                        .skip(start_idx as usize)
-                        .take((stop_idx - start_idx + 1) as usize)
-                        .cloned()
-                        .collect(),
-                );
-            }
+        let deque = entry.value.as_list()?;
+        let len = deque.len() as i64;
+
+        let start_idx = if start < 0 {
+            len.saturating_add(start).max(0)
+        } else {
+            start
+        };
+        let stop_idx = if stop < 0 {
+            len.saturating_add(stop)
+        } else {
+            stop.min(len - 1)
+        };
+
+        if start_idx > stop_idx || start_idx >= len {
+            return Ok(Vec::new());
         }
-        None
+
+        Ok(deque
+            .iter()
+            .skip(start_idx as usize)
+            .take((stop_idx - start_idx + 1) as usize)
+            .cloned()
+            .collect())
     }
 
-    pub async fn llen(&self, key: &str) -> usize {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn llen(&self, key: &str) -> DbResult<usize> {
         let entries = self.shard(key).read().await;
-        if let Some(entry) = entries.get(key) {
-            if is_expired(entry) {
-                return 0;
-            }
-            if let Value::List(ref deque) = entry.value {
-                return deque.len();
-            }
+
+        match live(&entries, key) {
+            None => Ok(0),
+            Some(entry) => Ok(entry.value.as_list()?.len()),
         }
-        0
     }
 
     // Sets engine
 
-    pub async fn sadd(&self, key: String, member: Bytes) -> usize {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn sadd_many(&self, key: String, members: Vec<Bytes>) -> DbResult<usize> {
         let mut entries = self.shard(&key).write().await;
         remove_if_expired(&mut entries, &key);
-        let entry = entries.entry(key).or_insert(DbEntry {
-            value: Value::Set(HashSet::new()),
-            expires_at: None,
-        });
-        if let Value::Set(ref mut set) = entry.value {
-            return if set.insert(member) { 1 } else { 0 };
-        }
-        0
-    }
 
-    pub async fn sadd_many(&self, key: String, members: Vec<Bytes>) -> usize {
-        let _gate = self.0.operation_gate.read().await;
-        let mut entries = self.shard(&key).write().await;
-        remove_if_expired(&mut entries, &key);
-        let entry = entries.entry(key).or_insert(DbEntry {
+        let entry = entries.entry(key).or_insert_with(|| DbEntry {
             value: Value::Set(HashSet::new()),
             expires_at: None,
         });
 
-        if let Value::Set(ref mut set) = entry.value {
-            let mut added = 0;
+        let set = entry.value.as_set_mut()?;
 
-            for member in members {
-                if set.insert(member) {
-                    added += 1;
-                }
-            }
-
-            added
-        } else {
-            0
-        }
+        Ok(members
+            .into_iter()
+            .filter(|m| set.insert(m.clone()))
+            .count())
     }
 
-    pub async fn smembers(&self, key: &str) -> Option<Vec<Bytes>> {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn smembers(&self, key: &str) -> DbResult<Vec<Bytes>> {
         let entries = self.shard(key).read().await;
-        if let Some(entry) = entries.get(key) {
-            if is_expired(entry) {
-                return None;
-            }
-            if let Value::Set(ref set) = entry.value {
-                return Some(set.iter().cloned().collect());
-            }
+
+        match live(&entries, key) {
+            None => Ok(Vec::new()),
+            Some(entry) => Ok(entry.value.as_set()?.iter().cloned().collect()),
         }
-        None
     }
 
-    pub async fn sismember(&self, key: &str, member: &Bytes) -> usize {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn sismember(&self, key: &str, member: &Bytes) -> DbResult<usize> {
         let entries = self.shard(key).read().await;
-        if let Some(entry) = entries.get(key) {
-            if is_expired(entry) {
-                return 0;
-            }
-            if let Value::Set(ref set) = entry.value {
-                return if set.contains(member) { 1 } else { 0 };
-            }
+
+        match live(&entries, key) {
+            None => Ok(0),
+            Some(entry) => Ok(entry.value.as_set()?.contains(member) as usize),
         }
-        0
     }
 
-    pub async fn srem(&self, key: &str, member: &Bytes) -> usize {
-        let _gate = self.0.operation_gate.read().await;
+    pub async fn srem(&self, key: &str, members: &[Bytes]) -> DbResult<usize> {
         let mut entries = self.shard(key).write().await;
         remove_if_expired(&mut entries, key);
-        if let Some(entry) = entries.get_mut(key) {
-            if let Value::Set(ref mut set) = entry.value {
-                return if set.remove(member) { 1 } else { 0 };
-            }
-        }
-        0
+
+        let Some(entry) = entries.get_mut(key) else {
+            return Ok(0);
+        };
+
+        let set = entry.value.as_set_mut()?;
+        let removed = members.iter().filter(|m| set.remove(*m)).count();
+
+        drop_if_empty(&mut entries, key);
+
+        Ok(removed)
     }
 
-    pub async fn sinter(&self, key1: &str, key2: &str) -> Vec<Bytes> {
-        let _gate = self.0.operation_gate.write().await;
+    // Reads every key's set under its shard lock. Missing key = empty set.
+    async fn collect_sets(
+        shards: &mut LockedShards<'_>,
+        keys: &[String],
+    ) -> DbResult<Vec<HashSet<Bytes>>> {
+        let mut sets = Vec::with_capacity(keys.len());
 
-        let set1 = {
-            let entries = self.shard(key1).read().await;
+        for key in keys {
+            let entries = shards.map(key);
+            remove_if_expired(entries, key);
 
-            match entries.get(key1) {
-                Some(entry) if !is_expired(entry) => match &entry.value {
-                    Value::Set(set) => set.clone(),
-                    _ => return vec![],
-                },
-                _ => return vec![],
-            }
-        };
+            sets.push(match entries.get(key) {
+                None => HashSet::new(),
+                Some(entry) => entry.value.as_set()?.clone(),
+            });
+        }
 
-        let set2 = {
-            let entries = self.shard(key2).read().await;
+        Ok(sets)
+    }
 
-            match entries.get(key2) {
-                Some(entry) if !is_expired(entry) => match &entry.value {
-                    Value::Set(set) => set.clone(),
-                    _ => return vec![],
-                },
-                _ => return vec![],
-            }
-        };
+    pub async fn sinter(&self, keys: &[String]) -> DbResult<Vec<Bytes>> {
+        let mut shards = self.lock_keys(keys).await;
+        let mut sets = Self::collect_sets(&mut shards, keys).await?.into_iter();
 
-        set1.intersection(&set2).cloned().collect()
+        let mut result = sets.next().unwrap_or_default();
+
+        for other in sets {
+            result.retain(|member| other.contains(member));
+        }
+
+        Ok(result.into_iter().collect())
+    }
+
+    pub async fn sunion(&self, keys: &[String]) -> DbResult<Vec<Bytes>> {
+        let mut shards = self.lock_keys(keys).await;
+        let sets = Self::collect_sets(&mut shards, keys).await?;
+
+        let mut result = HashSet::new();
+
+        for set in sets {
+            result.extend(set);
+        }
+
+        Ok(result.into_iter().collect())
     }
 
     // Sorted sets engine
 
-    pub async fn zadd(&self, key: String, score: f64, value: Bytes) -> usize {
-        self.zadd_many(key, vec![(score, value)]).await
-    }
-
-    pub async fn zadd_many(&self, key: String, members: Vec<(f64, Bytes)>) -> usize {
-        let _gate = self.0.operation_gate.read().await;
-
+    pub async fn zadd_many(&self, key: String, members: Vec<(f64, Bytes)>) -> DbResult<usize> {
         let mut entries = self.shard(&key).write().await;
 
         remove_if_expired(&mut entries, &key);
 
-        let entry = entries.entry(key).or_insert(DbEntry {
+        let entry = entries.entry(key).or_insert_with(|| DbEntry {
             value: Value::SortedSet(SortedSet::new()),
             expires_at: None,
         });
 
-        let Value::SortedSet(zset) = &mut entry.value else {
-            return 0;
-        };
+        let zset = entry.value.as_zset_mut()?;
 
         let mut added = 0;
 
@@ -912,21 +1093,18 @@ impl SharedDb {
             let previous_score = zset.scores.insert(value.clone(), score);
 
             if let Some(previous_score) = previous_score {
-                // Remove the old score-index entry.
                 zset.remove_member(&ZSetMember {
                     score: previous_score,
                     value: value.clone(),
                 });
             } else {
-                // Only a previously absent member increases the count.
                 added += 1;
             }
 
-            // Insert the member using its updated score.
             zset.insert_member(ZSetMember { score, value });
         }
 
-        added
+        Ok(added)
     }
 
     pub async fn zrange(
@@ -935,29 +1113,20 @@ impl SharedDb {
         start: i64,
         end: i64,
         reverse: bool,
-    ) -> Option<Vec<ZSetMember>> {
-        let _gate = self.0.operation_gate.read().await;
-
+    ) -> DbResult<Vec<ZSetMember>> {
         let entries = self.shard(key).read().await;
 
-        let entry = entries.get(key)?;
-
-        if is_expired(entry) {
-            return None;
-        }
-
-        let Value::SortedSet(zset) = &entry.value else {
-            return None;
+        let Some(entry) = live(&entries, key) else {
+            return Ok(Vec::new());
         };
 
+        let zset = entry.value.as_zset()?;
         let len = zset.len() as i64;
 
         if len == 0 {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
-        // Normalize negative ranks.
-        // A negative start below the valid range is clamped to zero.
         let start_index = if start < 0 {
             len.saturating_add(start).max(0)
         } else {
@@ -971,7 +1140,7 @@ impl SharedDb {
         };
 
         if start_index >= len || end_index < 0 || start_index > end_index {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         let end_index = end_index.min(len - 1);
@@ -990,30 +1159,60 @@ impl SharedDb {
             }
         }
 
-        Some(result)
+        Ok(result)
     }
 
-    pub async fn zrem(&self, key: &str, value: &Bytes) -> usize {
-        let _gate = self.0.operation_gate.read().await;
-
+    pub async fn zrem(&self, key: &str, values: &[Bytes]) -> DbResult<usize> {
         let mut entries = self.shard(key).write().await;
-
         remove_if_expired(&mut entries, key);
 
-        if let Some(entry) = entries.get_mut(key) {
-            if let Value::SortedSet(zset) = &mut entry.value {
-                if let Some(score) = zset.scores.remove(value) {
-                    zset.remove_member(&ZSetMember {
-                        score,
-                        value: value.clone(),
-                    });
+        let Some(entry) = entries.get_mut(key) else {
+            return Ok(0);
+        };
 
-                    return 1;
-                }
+        let zset = entry.value.as_zset_mut()?;
+        let mut removed = 0;
+
+        for value in values {
+            if let Some(score) = zset.scores.remove(value) {
+                zset.remove_member(&ZSetMember {
+                    score,
+                    value: value.clone(),
+                });
+                removed += 1;
             }
         }
 
-        0
+        drop_if_empty(&mut entries, key);
+
+        Ok(removed)
+    }
+
+    pub async fn zscore(&self, key: &str, member: &Bytes) -> DbResult<Option<f64>> {
+        let entries = self.shard(key).read().await;
+
+        match live(&entries, key) {
+            None => Ok(None),
+            Some(entry) => Ok(entry.value.as_zset()?.scores.get(member).copied()),
+        }
+    }
+
+    pub async fn zcard(&self, key: &str) -> DbResult<usize> {
+        let entries = self.shard(key).read().await;
+
+        match live(&entries, key) {
+            None => Ok(0),
+            Some(entry) => Ok(entry.value.as_zset()?.len()),
+        }
+    }
+
+    pub async fn zrank(&self, key: &str, member: &Bytes) -> DbResult<Option<usize>> {
+        let entries = self.shard(key).read().await;
+
+        match live(&entries, key) {
+            None => Ok(None),
+            Some(entry) => Ok(entry.value.as_zset()?.rank(member)),
+        }
     }
     // Pub-Sub engine
 
@@ -1092,12 +1291,11 @@ impl SharedDb {
     }
 
     pub async fn remove_expired(&self) -> usize {
-        let _gate = self.0.operation_gate.write().await;
+        let mut shards = self.lock_all().await;
         let now = Instant::now();
         let mut removed = 0;
 
-        for shard in &self.0.shards {
-            let mut entries = shard.write().await;
+        for (_, entries) in shards.guards.iter_mut() {
             let previous_count = entries.len();
 
             entries.retain(|_, entry| match entry.expires_at {
@@ -1110,7 +1308,6 @@ impl SharedDb {
     }
 
     pub async fn pexpire(&self, key: &str, milliseconds: u64) -> usize {
-        let _gate = self.0.operation_gate.read().await;
         let mut entries = self.shard(key).write().await;
 
         remove_if_expired(&mut entries, key);
@@ -1126,7 +1323,6 @@ impl SharedDb {
     }
 
     pub async fn persist(&self, key: &str) -> usize {
-        let _gate = self.0.operation_gate.read().await;
         let mut entries = self.shard(key).write().await;
 
         remove_if_expired(&mut entries, key);

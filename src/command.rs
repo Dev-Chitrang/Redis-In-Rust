@@ -23,7 +23,18 @@ pub enum Commands {
     PTtl {
         key: String,
     },
-    Scan,
+    Scan {
+        cursor: u64,
+        pattern: Option<String>,
+        count: usize,
+    },
+    Keys {
+        pattern: String,
+    },
+    Type {
+        key: String,
+    },
+    BgRewriteAof,
     FlushAll,
 
     // String and numeric counters
@@ -77,7 +88,7 @@ pub enum Commands {
     },
     HDel {
         key: String,
-        field: String,
+        fields: Vec<String>,
     },
     HKeys {
         key: String,
@@ -114,7 +125,7 @@ pub enum Commands {
     },
     SRem {
         key: String,
-        value: Bytes,
+        values: Vec<Bytes>,
     },
     SMembers {
         key: String,
@@ -124,8 +135,10 @@ pub enum Commands {
         value: Bytes,
     },
     SInter {
-        key1: String,
-        key2: String,
+        keys: Vec<String>,
+    },
+    SUnion {
+        keys: Vec<String>,
     },
 
     // Sorted Sets
@@ -135,7 +148,18 @@ pub enum Commands {
     },
     ZRem {
         key: String,
-        value: Bytes,
+        values: Vec<Bytes>,
+    },
+    ZCard {
+        key: String,
+    },
+    ZScore {
+        key: String,
+        member: Bytes,
+    },
+    ZRank {
+        key: String,
+        member: Bytes,
     },
     ZRange {
         key: String,
@@ -183,6 +207,8 @@ pub enum Commands {
     Error(String),
     Unknown(String),
 }
+
+const MAX_EXPIRE_SECS: u64 = u32::MAX as u64;
 
 pub struct RespSerializer;
 
@@ -340,6 +366,9 @@ impl Commands {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let seconds_str = String::from_utf8(args.get(2)?.to_vec()).ok()?;
                 let seconds = seconds_str.trim().parse::<u64>().ok()?;
+                if seconds > MAX_EXPIRE_SECS {
+                    return None;
+                }
                 Commands::Expire { key, seconds }
             }
 
@@ -347,6 +376,9 @@ impl Commands {
                 let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
                 let milliseconds_str = String::from_utf8(args.get(2)?.to_vec()).ok()?;
                 let milliseconds = milliseconds_str.trim().parse::<u64>().ok()?;
+                if milliseconds > MAX_EXPIRE_SECS * 1000 {
+                    return None;
+                }
                 Commands::PExpire { key, milliseconds }
             }
 
@@ -365,7 +397,50 @@ impl Commands {
                 Commands::PTtl { key }
             }
 
-            "SCAN" => Commands::Scan,
+            "SCAN" => {
+                let cursor = std::str::from_utf8(&args[1])
+                    .ok()?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()?;
+                let mut pattern = None;
+                let mut count = 10_usize;
+                let mut i = 2;
+
+                while i < args.len() {
+                    let option = String::from_utf8_lossy(&args[i]).to_uppercase();
+                    let value = args.get(i + 1)?;
+
+                    match option.as_str() {
+                        "MATCH" => pattern = Some(String::from_utf8_lossy(value).into_owned()),
+                        "COUNT" => {
+                            count = std::str::from_utf8(value).ok()?.trim().parse().ok()?;
+                            if count == 0 {
+                                return None;
+                            }
+                        }
+                        _ => return None,
+                    }
+
+                    i += 2;
+                }
+
+                Commands::Scan {
+                    cursor,
+                    pattern,
+                    count,
+                }
+            }
+
+            "KEYS" => Commands::Keys {
+                pattern: String::from_utf8_lossy(&args[1]).into_owned(),
+            },
+
+            "TYPE" => Commands::Type {
+                key: String::from_utf8_lossy(&args[1]).into_owned(),
+            },
+
+            "BGREWRITEAOF" => Commands::BgRewriteAof,
 
             "FLUSHALL" => Commands::FlushAll,
 
@@ -389,7 +464,12 @@ impl Commands {
                                 .ok()?
                                 .parse::<u64>()
                                 .ok()?;
-                            if amount == 0 {
+                            let limit = if option == "EX" {
+                                MAX_EXPIRE_SECS
+                            } else {
+                                MAX_EXPIRE_SECS * 1000
+                            };
+                            if amount == 0 || amount > limit {
                                 return None;
                             }
                             expiry = Some(if option == "EX" {
@@ -519,9 +599,12 @@ impl Commands {
             }
 
             "HDEL" => {
-                let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let field = String::from_utf8_lossy(&args.get(2)?).into_owned();
-                Commands::HDel { key, field }
+                let key = String::from_utf8_lossy(&args[1]).into_owned();
+                let fields = args[2..]
+                    .iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+                Commands::HDel { key, fields }
             }
 
             "HKEYS" => {
@@ -582,9 +665,9 @@ impl Commands {
             }
 
             "SREM" => {
-                let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let value = args.get(2)?.clone();
-                Commands::SRem { key, value }
+                let key = String::from_utf8_lossy(&args[1]).into_owned();
+                let values = args[2..].to_vec();
+                Commands::SRem { key, values }
             }
 
             "SMEMBERS" => {
@@ -598,10 +681,17 @@ impl Commands {
                 Commands::SIsMember { key, value }
             }
 
-            "SINTER" => {
-                let key1 = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let key2 = String::from_utf8_lossy(&args.get(2)?).into_owned();
-                Commands::SInter { key1, key2 }
+            "SINTER" | "SUNION" => {
+                let keys = args[1..]
+                    .iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+
+                if command_verb == "SINTER" {
+                    Commands::SInter { keys }
+                } else {
+                    Commands::SUnion { keys }
+                }
             }
 
             "ZADD" => {
@@ -634,9 +724,26 @@ impl Commands {
             }
 
             "ZREM" => {
-                let key = String::from_utf8_lossy(&args.get(1)?).into_owned();
-                let value = args.get(2)?.clone();
-                Commands::ZRem { key, value }
+                let key = String::from_utf8_lossy(&args[1]).into_owned();
+                let values = args[2..].to_vec();
+                Commands::ZRem { key, values }
+            }
+
+            "ZSCORE" => {
+                let key = String::from_utf8_lossy(&args[1]).into_owned();
+                let member = args[2].clone();
+                Commands::ZScore { key, member }
+            }
+
+            "ZCARD" => {
+                let key = String::from_utf8_lossy(&args[1]).into_owned();
+                Commands::ZCard { key }
+            }
+
+            "ZRANK" => {
+                let key = String::from_utf8_lossy(&args[1]).into_owned();
+                let member = args[2].clone();
+                Commands::ZRank { key, member }
             }
 
             "ZRANGE" | "ZREVRANGE" => {
@@ -720,6 +827,47 @@ impl Commands {
             _ => Commands::Unknown(command_verb),
         };
         Some((cmd, total_consumed))
+    }
+
+    pub fn allowed_while_subscribed(&self) -> bool {
+        matches!(
+            self,
+            Commands::Subscribe { .. }
+                | Commands::Unsubscribe { .. }
+                | Commands::PSubscribe { .. }
+                | Commands::PUnsubscribe { .. }
+                | Commands::Ping { .. }
+                | Commands::Error(_)
+                | Commands::Unknown(_)
+        )
+    }
+
+    pub fn should_persist(&self) -> bool {
+        matches!(
+            self,
+            Commands::Del { .. }
+                | Commands::Expire { .. }
+                | Commands::PExpire { .. }
+                | Commands::Persist { .. }
+                | Commands::FlushAll
+                | Commands::Set { .. }
+                | Commands::SetNx { .. }
+                | Commands::Incr { .. }
+                | Commands::Decr { .. }
+                | Commands::IncrBy { .. }
+                | Commands::DecrBy { .. }
+                | Commands::MSet { .. }
+                | Commands::HSet { .. }
+                | Commands::HDel { .. }
+                | Commands::LPush { .. }
+                | Commands::RPush { .. }
+                | Commands::LPop { .. }
+                | Commands::RPop { .. }
+                | Commands::SAdd { .. }
+                | Commands::SRem { .. }
+                | Commands::ZAdd { .. }
+                | Commands::ZRem { .. }
+        )
     }
 }
 
@@ -824,19 +972,24 @@ fn validate_resp_frame(src: &[u8]) -> Result<Option<usize>, String> {
 fn validate_command_args(command: &str, argc: usize) -> Result<(), String> {
     let valid = match command {
         // Zero or one argument
-        "HELLO" | "SCAN" | "FLUSHALL" => argc == 1,
+        "HELLO" | "BGREWITEAOF" | "FLUSHALL" => argc == 1,
+        "SCAN" => argc >= 2,
         "PING" => (1..=2).contains(&argc),
 
         // Exactly one key
         "TTL" | "PTTL" | "PERSIST" | "GET" | "INCR" | "DECR" | "HGETALL" | "HKEYS" | "LPOP"
-        | "RPOP" | "LLEN" | "SMEMBERS" => argc == 2,
+        | "RPOP" | "LLEN" | "SMEMBERS" | "KEYS" | "TYPE" | "ZCARD" => argc == 2,
 
         // One or more keys
         "EXISTS" | "DEL" | "MGET" => argc >= 2,
 
         // Exactly two arguments after the command
-        "EXPIRE" | "PEXPIRE" | "SETNX" | "INCRBY" | "DECRBY" | "HGET" | "HDEL" | "SREM"
-        | "SISMEMBER" | "ZREM" => argc == 3,
+        "EXPIRE" | "PEXPIRE" | "SETNX" | "INCRBY" | "DECRBY" | "HGET" | "SISMEMBER" | "ZSCORE"
+        | "ZRANK" => argc == 3,
+
+        "HDEL" | "SREM" | "ZREM" => argc >= 3,
+
+        "SINTER" | "SUNION" => argc >= 2,
 
         "SET" => argc >= 3,
 
@@ -844,7 +997,7 @@ fn validate_command_args(command: &str, argc: usize) -> Result<(), String> {
 
         "LPUSH" | "RPUSH" | "SADD" => argc >= 3,
 
-        "LRANGE" | "SINTER" => argc == 4,
+        "LRANGE" => argc == 4,
 
         "ZADD" => argc >= 4 && argc % 2 == 0,
 

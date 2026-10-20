@@ -8,6 +8,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinSet;
 
+use crate::persistence::Aof;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
     Single,
@@ -16,6 +18,7 @@ pub enum ExecutionMode {
 
 pub struct Server {
     db: SharedDb,
+    aof: Aof,
     listener: TcpListener,
     mode: ExecutionMode,
     command_lock: Option<Arc<Mutex<()>>>,
@@ -26,6 +29,7 @@ impl Server {
         addr: &str,
         db: SharedDb,
         mode: ExecutionMode,
+        aof: Aof,
     ) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind(addr).await?;
 
@@ -36,6 +40,7 @@ impl Server {
 
         Ok(Self {
             db,
+            aof,
             listener,
             mode,
             command_lock,
@@ -45,6 +50,7 @@ impl Server {
     pub async fn run(self) -> Result<(), std::io::Error> {
         let Server {
             db,
+            aof,
             listener,
             mode,
             command_lock,
@@ -98,10 +104,11 @@ impl Server {
                     let connection_db = db.clone();
                     let connection_lock = command_lock.clone();
                     let connection_shutdown = shutdown_rx.clone();
-
+                    let connection_aof = aof.clone();
                     connections.spawn(async move {
                         let handler = Handler::new(
                             connection_db,
+                            connection_aof,
                             stream,
                             connection_lock,
                         );
@@ -152,6 +159,9 @@ impl Server {
         }
 
         println!("All connection tasks finished.");
+        if let Err(error) = aof.sync().await {
+            eprintln!("Failed to sync AOF: {}", error);
+        }
         println!("Redis Clone shut down successfully.");
 
         Ok(())

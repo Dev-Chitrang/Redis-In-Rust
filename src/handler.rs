@@ -1,5 +1,5 @@
 use crate::command::{Commands, ParseOutcome, RespSerializer};
-use crate::store::SharedDb;
+use crate::store::{DbResult, SharedDb};
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -11,8 +11,11 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::persistence::Aof;
+
 pub struct Handler {
     db: SharedDb,
+    aof: Aof,
     stream: TcpStream,
     buffer: Vec<u8>,
     command_lock: Option<Arc<Mutex<()>>>,
@@ -37,10 +40,16 @@ enum PubSubEvent {
 }
 
 impl Handler {
-    pub fn new(db: SharedDb, stream: TcpStream, command_lock: Option<Arc<Mutex<()>>>) -> Self {
+    pub fn new(
+        db: SharedDb,
+        aof: Aof,
+        stream: TcpStream,
+        command_lock: Option<Arc<Mutex<()>>>,
+    ) -> Self {
         let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
         Self {
             db,
+            aof,
             stream,
             buffer: Vec::with_capacity(4096),
             command_lock,
@@ -114,7 +123,18 @@ impl Handler {
                         ));
                     }
 
+                    let raw_command = self.buffer[..consumed].to_vec();
+                    let should_persist = cmd.should_persist();
+                    let is_setnx = matches!(&cmd, Commands::SetNx { .. });
+
                     self.buffer.drain(..consumed);
+
+                    // Keep "execute + append" atomic w.r.t. AOF rewrite.
+                    let aof_guard = if should_persist {
+                        Some(self.aof.begin_write().await)
+                    } else {
+                        None
+                    };
 
                     let response = if let Some(command_lock) = self.command_lock.clone() {
                         let _guard = command_lock.lock().await;
@@ -122,6 +142,18 @@ impl Handler {
                     } else {
                         self.execute_command(cmd).await
                     };
+
+                    let failed_conditional =
+                        response == b"$-1\r\n" || (is_setnx && response == b":0\r\n");
+
+                    if should_persist
+                        && !response.starts_with(b"-")
+                        && response != b"$-1\r\n"
+                        && !failed_conditional
+                    {
+                        self.aof.append(&raw_command).await?;
+                        drop(aof_guard);
+                    }
 
                     if !response.is_empty() {
                         self.stream.write_all(&response).await?;
@@ -382,6 +414,11 @@ impl Handler {
     }
 
     async fn execute_command(&mut self, cmd: Commands) -> Vec<u8> {
+        if self.subscription_count() > 0 && !cmd.allowed_while_subscribed() {
+            return RespSerializer::error(
+                "ERR only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING are allowed in this context",
+            );
+        }
         match cmd {
             Commands::Error(message) => RespSerializer::error(&message),
             // Add this match arm inside execute_command:
@@ -392,7 +429,12 @@ impl Handler {
                 RespSerializer::bulk_string(b"2"),
             ]),
             Commands::Ping { message } => {
-                if let Some(msg) = message {
+                if self.subscription_count() > 0 {
+                    RespSerializer::array(vec![
+                        RespSerializer::bulk_string(b"pong"),
+                        RespSerializer::bulk_string(message.as_deref().unwrap_or(b"")),
+                    ])
+                } else if let Some(msg) = message {
                     RespSerializer::bulk_string(&msg)
                 } else {
                     RespSerializer::simple_string("PONG")
@@ -420,13 +462,43 @@ impl Handler {
                 let remaining = self.db.pttl(&key).await;
                 RespSerializer::integer(remaining)
             }
-            Commands::Scan => {
-                let keys = self.db.scan().await;
-                let mut mapped = Vec::new();
-                for k in keys {
-                    mapped.push(RespSerializer::bulk_string(k.as_bytes()));
-                }
-                RespSerializer::array(mapped)
+            Commands::Scan {
+                cursor,
+                pattern,
+                count,
+            } => {
+                let (next, keys) = self.db.scan(cursor, pattern.as_deref(), count).await;
+
+                RespSerializer::array(vec![
+                    RespSerializer::bulk_string(next.to_string().as_bytes()),
+                    RespSerializer::array(
+                        keys.iter()
+                            .map(|k| RespSerializer::bulk_string(k.as_bytes()))
+                            .collect(),
+                    ),
+                ])
+            }
+            Commands::Keys { pattern } => {
+                let keys = self.db.keys(&pattern).await;
+
+                RespSerializer::array(
+                    keys.iter()
+                        .map(|k| RespSerializer::bulk_string(k.as_bytes()))
+                        .collect(),
+                )
+            }
+            Commands::Type { key } => RespSerializer::simple_string(self.db.type_of(&key).await),
+            Commands::BgRewriteAof => {
+                let aof = self.aof.clone();
+                let db = self.db.clone();
+
+                tokio::spawn(async move {
+                    if let Err(error) = aof.rewrite(&db).await {
+                        eprintln!("[AOF] rewrite failed: {}", error);
+                    }
+                });
+
+                RespSerializer::simple_string("Background append only file rewriting started")
             }
             Commands::FlushAll => {
                 self.db.flushall().await;
@@ -449,157 +521,97 @@ impl Handler {
                     RespSerializer::null_bulk_string()
                 }
             }
-            Commands::Get { key } => {
-                if let Some(bytes) = self.db.get(&key).await {
-                    RespSerializer::bulk_string(&bytes)
-                } else {
-                    RespSerializer::null_bulk_string()
-                }
-            }
+            Commands::Get { key } => opt_bulk(self.db.get(&key).await),
             Commands::SetNx { key, value } => {
                 let count = self.db.setnx(key, value).await;
                 RespSerializer::integer(count as i64)
             }
             Commands::Incr { key } => self.handle_incrby(key, 1).await,
-            Commands::Decr { key } => self.handle_incrby(key, -1).await,
+            Commands::Decr { key } => self.handle_incrby(key, -11).await,
+            Commands::DecrBy { key, amount } => match amount.checked_neg() {
+                Some(negated) => self.handle_incrby(key, negated).await,
+                None => RespSerializer::error("ERR decrement would overflow"),
+            },
             Commands::IncrBy { key, amount } => self.handle_incrby(key, amount).await,
-            Commands::DecrBy { key, amount } => self.handle_incrby(key, -amount).await,
             Commands::MSet { keys, values } => {
-                for (i, key) in keys.into_iter().enumerate() {
-                    if let Some(val) = values.get(i) {
-                        self.db.set(key, val.clone()).await;
-                    }
-                }
+                self.db.mset(keys, values).await;
                 self.simple_ok()
             }
             Commands::MGet { keys } => {
-                let mut items = Vec::new();
-                for key in keys {
-                    if let Some(bytes) = self.db.get(&key).await {
-                        items.push(RespSerializer::bulk_string(&bytes));
-                    } else {
-                        items.push(RespSerializer::null_bulk_string());
-                    }
-                }
-                RespSerializer::array(items)
+                let values = self.db.mget(&keys).await;
+
+                RespSerializer::array(
+                    values
+                        .into_iter()
+                        .map(|value| match value {
+                            Some(bytes) => RespSerializer::bulk_string(&bytes),
+                            None => RespSerializer::null_bulk_string(),
+                        })
+                        .collect(),
+                )
             }
 
             // --- Hashes ---
-            Commands::HSet { key, fields } => {
-                let added = self.db.hset_many(key, fields).await;
-                RespSerializer::integer(added as i64)
-            }
-
-            Commands::HGet { key, field } => {
-                if let Some(bytes) = self.db.hget(&key, &field).await {
-                    RespSerializer::bulk_string(&bytes)
-                } else {
-                    RespSerializer::null_bulk_string()
-                }
-            }
-            Commands::HGetAll { key } => {
-                if let Some(pairs) = self.db.hgetall(&key).await {
-                    let mut elements = Vec::new();
-                    for (f, v) in pairs {
-                        elements.push(RespSerializer::bulk_string(f.as_bytes()));
-                        elements.push(RespSerializer::bulk_string(&v));
+            // --- Hashes ---
+            Commands::HSet { key, fields } => int_reply(self.db.hset_many(key, fields).await),
+            Commands::HGet { key, field } => opt_bulk(self.db.hget(&key, &field).await),
+            Commands::HGetAll { key } => match self.db.hgetall(&key).await {
+                Ok(pairs) => {
+                    let mut elements = Vec::with_capacity(pairs.len() * 2);
+                    for (field, value) in pairs {
+                        elements.push(RespSerializer::bulk_string(field.as_bytes()));
+                        elements.push(RespSerializer::bulk_string(&value));
                     }
                     RespSerializer::array(elements)
-                } else {
-                    RespSerializer::array(vec![])
                 }
-            }
-            Commands::HDel { key, field } => {
-                let res = self.db.hdel(&key, &field).await;
-                RespSerializer::integer(res as i64)
-            }
-            Commands::HKeys { key } => {
-                if let Some(keys) = self.db.hkeys(&key).await {
-                    let elements = keys
-                        .into_iter()
+                Err(error) => RespSerializer::error(error),
+            },
+            Commands::HDel { key, fields } => int_reply(self.db.hdel(&key, &fields).await),
+            Commands::HKeys { key } => match self.db.hkeys(&key).await {
+                Ok(keys) => RespSerializer::array(
+                    keys.iter()
                         .map(|k| RespSerializer::bulk_string(k.as_bytes()))
-                        .collect();
-                    RespSerializer::array(elements)
-                } else {
-                    RespSerializer::array(vec![])
-                }
-            }
+                        .collect(),
+                ),
+                Err(error) => RespSerializer::error(error),
+            },
 
             // --- Lists ---
             Commands::LPush { key, values } => {
-                match self.db.push_list_many(key, values, true).await {
-                    Ok(len) => RespSerializer::integer(len as i64),
-                    Err(error) => RespSerializer::error(error),
-                }
+                int_reply(self.db.push_list_many(key, values, true).await)
             }
-
             Commands::RPush { key, values } => {
-                match self.db.push_list_many(key, values, false).await {
-                    Ok(len) => RespSerializer::integer(len as i64),
-                    Err(error) => RespSerializer::error(error),
-                }
+                int_reply(self.db.push_list_many(key, values, false).await)
             }
             Commands::LPop { key } => self.handle_pop_list(&key, true).await,
             Commands::RPop { key } => self.handle_pop_list(&key, false).await,
             Commands::LRange { key, start, end } => {
-                if let Some(slice) = self.db.lrange(&key, start, end).await {
-                    let elements = slice
-                        .into_iter()
-                        .map(|b| RespSerializer::bulk_string(&b))
-                        .collect();
-                    RespSerializer::array(elements)
-                } else {
-                    RespSerializer::array(vec![])
-                }
+                bulk_array(self.db.lrange(&key, start, end).await)
             }
-            Commands::LLen { key } => {
-                let len = self.db.llen(&key).await;
-                RespSerializer::integer(len as i64)
-            }
+            Commands::LLen { key } => int_reply(self.db.llen(&key).await),
 
             // --- Sets ---
-            Commands::SAdd { key, members } => {
-                let added = self.db.sadd_many(key, members).await;
-                RespSerializer::integer(added as i64)
-            }
-
-            Commands::SRem { key, value } => {
-                let res = self.db.srem(&key, &value).await;
-                RespSerializer::integer(res as i64)
-            }
-            Commands::SMembers { key } => {
-                if let Some(members) = self.db.smembers(&key).await {
-                    let mut elements = Vec::new();
-                    for m in members {
-                        elements.push(RespSerializer::bulk_string(&m));
-                    }
-                    RespSerializer::array(elements)
-                } else {
-                    RespSerializer::array(vec![])
-                }
-            }
-            Commands::SIsMember { key, value } => {
-                let res = self.db.sismember(&key, &value).await;
-                RespSerializer::integer(res as i64)
-            }
-            Commands::SInter { key1, key2 } => {
-                let matches = self.db.sinter(&key1, &key2).await;
-                let elements = matches
-                    .into_iter()
-                    .map(|b| RespSerializer::bulk_string(&b))
-                    .collect();
-                RespSerializer::array(elements)
-            }
+            Commands::SAdd { key, members } => int_reply(self.db.sadd_many(key, members).await),
+            Commands::SRem { key, values } => int_reply(self.db.srem(&key, &values).await),
+            Commands::SMembers { key } => bulk_array(self.db.smembers(&key).await),
+            Commands::SIsMember { key, value } => int_reply(self.db.sismember(&key, &value).await),
+            Commands::SInter { keys } => bulk_array(self.db.sinter(&keys).await),
+            Commands::SUnion { keys } => bulk_array(self.db.sunion(&keys).await),
 
             // --- Sorted Sets (ZSets) ---
-            Commands::ZAdd { key, members } => {
-                let res = self.db.zadd_many(key, members).await;
-                RespSerializer::integer(res as i64)
-            }
-            Commands::ZRem { key, value } => {
-                let res = self.db.zrem(&key, &value).await;
-                RespSerializer::integer(res as i64)
-            }
+            Commands::ZAdd { key, members } => int_reply(self.db.zadd_many(key, members).await),
+            Commands::ZRem { key, values } => int_reply(self.db.zrem(&key, &values).await),
+            Commands::ZScore { key, member } => match self.db.zscore(&key, &member).await {
+                Ok(Some(score)) => RespSerializer::bulk_string(score.to_string().as_bytes()),
+                Ok(None) => RespSerializer::null_bulk_string(),
+                Err(error) => RespSerializer::error(error),
+            },
+            Commands::ZCard { key } => int_reply(self.db.zcard(&key).await),
+            Commands::ZRank { key, member } => match self.db.zrank(&key, &member).await {
+                Ok(Some(rank)) => RespSerializer::integer(rank as i64),
+                Ok(None) => RespSerializer::null_bulk_string(),
+                Err(error) => RespSerializer::error(error),
+            },
             Commands::ZRange {
                 key,
                 start,
@@ -661,11 +673,7 @@ impl Handler {
     }
 
     async fn handle_pop_list(&self, key: &str, front: bool) -> Vec<u8> {
-        if let Some(bytes) = self.db.pop_list(key, front).await {
-            RespSerializer::bulk_string(&bytes)
-        } else {
-            RespSerializer::null_bulk_string()
-        }
+        opt_bulk(self.db.pop_list(key, front).await)
     }
 
     async fn handle_zrange(
@@ -676,18 +684,48 @@ impl Handler {
         with_scores: bool,
         reverse: bool,
     ) -> Vec<u8> {
-        if let Some(res) = self.db.zrange(key, start, end, reverse).await {
-            let mut elements = Vec::new();
-            for m in res {
-                // Treat m as a ZSetMember struct directly
-                elements.push(RespSerializer::bulk_string(&m.value));
-                if with_scores {
-                    elements.push(RespSerializer::bulk_string(m.score.to_string().as_bytes()));
+        match self.db.zrange(key, start, end, reverse).await {
+            Ok(members) => {
+                let mut elements = Vec::new();
+
+                for m in members {
+                    elements.push(RespSerializer::bulk_string(&m.value));
+
+                    if with_scores {
+                        elements.push(RespSerializer::bulk_string(m.score.to_string().as_bytes()));
+                    }
                 }
+
+                RespSerializer::array(elements)
             }
-            RespSerializer::array(elements)
-        } else {
-            RespSerializer::array(vec![])
+            Err(error) => RespSerializer::error(error),
         }
+    }
+}
+
+fn int_reply(result: DbResult<usize>) -> Vec<u8> {
+    match result {
+        Ok(n) => RespSerializer::integer(n as i64),
+        Err(error) => RespSerializer::error(error),
+    }
+}
+
+fn opt_bulk(result: DbResult<Option<Bytes>>) -> Vec<u8> {
+    match result {
+        Ok(Some(bytes)) => RespSerializer::bulk_string(&bytes),
+        Ok(None) => RespSerializer::null_bulk_string(),
+        Err(error) => RespSerializer::error(error),
+    }
+}
+
+fn bulk_array(result: DbResult<Vec<Bytes>>) -> Vec<u8> {
+    match result {
+        Ok(items) => RespSerializer::array(
+            items
+                .iter()
+                .map(|item| RespSerializer::bulk_string(item))
+                .collect(),
+        ),
+        Err(error) => RespSerializer::error(error),
     }
 }

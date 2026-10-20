@@ -1,8 +1,10 @@
 pub mod command;
 pub mod handler;
+pub mod persistence;
 pub mod server;
 pub mod store;
 
+use crate::persistence::{Aof, FsyncPolicy};
 use crate::server::{ExecutionMode, Server};
 use crate::store::SharedDb;
 
@@ -14,6 +16,7 @@ struct Config {
     host: String,
     port: u16,
     mode: ExecutionMode,
+    fsync: FsyncPolicy,
 }
 
 impl Config {
@@ -21,6 +24,7 @@ impl Config {
         let mut host = "127.0.0.1".to_string();
         let mut port = 6379_u16;
         let mut mode = ExecutionMode::Multi;
+        let mut fsync = FsyncPolicy::EverySec;
 
         let mut args = env::args().skip(1);
 
@@ -50,6 +54,23 @@ impl Config {
                     };
                 }
 
+                "--appendfsync" => {
+                    let value = args
+                        .next()
+                        .ok_or("--appendfsync requires always, everysec or no")?;
+
+                    fsync = match value.to_lowercase().as_str() {
+                        "always" => FsyncPolicy::Always,
+                        "everysec" => FsyncPolicy::EverySec,
+                        "no" => FsyncPolicy::No,
+                        _ => {
+                            return Err(
+                                "Invalid appendfsync. Use always, everysec or no".to_string()
+                            );
+                        }
+                    };
+                }
+
                 "--help" | "-h" => {
                     println!(
                         "Usage: redis-clone \
@@ -66,7 +87,7 @@ impl Config {
             }
         }
 
-        Ok(Self { host, port, mode })
+        Ok(Self { host, port, mode, fsync })
     }
 }
 
@@ -92,7 +113,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.block_on(async {
         let db = SharedDb::new();
 
-        let server = Server::new(&address, db, config.mode).await?;
+        // Restore the database before accepting client connections.
+        Aof::replay("appendonly.aof", &db).await?;
+
+        // Open the file for new commands after recovery.
+        let aof = Aof::open("appendonly.aof", config.fsync).await?;
+
+        let server = Server::new(&address, db, config.mode, aof).await?;
 
         server.run().await
     })?;
