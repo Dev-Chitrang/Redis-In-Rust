@@ -21,7 +21,7 @@ struct Config {
 
 impl Config {
     fn from_args() -> Result<Self, String> {
-        let mut host = "127.0.0.1".to_string();
+        let mut host = "0.0.0.0".to_string();
         let mut port = 6379_u16;
         let mut mode = ExecutionMode::Multi;
         let mut fsync = FsyncPolicy::EverySec;
@@ -87,7 +87,12 @@ impl Config {
             }
         }
 
-        Ok(Self { host, port, mode, fsync })
+        Ok(Self {
+            host,
+            port,
+            mode,
+            fsync,
+        })
     }
 }
 

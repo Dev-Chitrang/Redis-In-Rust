@@ -4,7 +4,7 @@ A Redis-inspired TCP server written in Rust with Tokio. It implements a subset o
 
 | **Language** | Rust (async, Tokio) |
 | **Protocol** | RESP2 |
-| **Default address** | `127.0.0.1:6379` (configurable) |
+| **Default address** | `0.0.0.0:6379` (configurable) |
 | **Execution modes** | `single` (one thread, serialized commands) or `multi` (default, multi-threaded) |
 | **Storage** | In-memory, 64-shard keyspace |
 | **Persistence** | Append-only file (`appendonly.aof`), replayed on startup |
@@ -16,19 +16,21 @@ A Redis-inspired TCP server written in Rust with Tokio. It implements a subset o
 
 1.  [Features](#1-features)
 2.  [Quick Start](#2-quick-start)
-3.  [Project Layout](#3-project-layout)
-4.  [Architecture](#4-architecture)
-5.  [Request Lifecycle](#5-request-lifecycle)
-6.  [Module Reference](#6-module-reference)
-7.  [Supported Commands](#7-supported-commands)
-8.  [Concurrency and Atomicity](#8-concurrency-and-atomicity)
-9.  [Key Expiry (TTL)](#9-key-expiry-ttl)
-10.  [Persistence (AOF)](#10-persistence-aof)
-11.  [Pub/Sub](#11-pubsub)
-12.  [Graceful Shutdown](#12-graceful-shutdown)
-13.  [Testing](#13-testing)
-14.  [Known Limitations](#14-known-limitations)
-15.  [Future Work](#15-future-work)
+3.  [Docker](#3-docker)
+4.  [Install from GitHub Releases](#4-install-from-github-releases)
+5.  [Project Layout](#5-project-layout)
+6.  [Architecture](#6-architecture)
+7.  [Request Lifecycle](#7-request-lifecycle)
+8.  [Module Reference](#8-module-reference)
+9.  [Supported Commands](#9-supported-commands)
+10. [Concurrency and Atomicity](#10-concurrency-and-atomicity)
+11. [Key Expiry (TTL)](#11-key-expiry-ttl)
+12. [Persistence (AOF)](#12-persistence-aof)
+13. [Pub/Sub](#13-pubsub)
+14. [Graceful Shutdown](#14-graceful-shutdown)
+15. [Testing](#15-testing)
+16. [Known Limitations](#16-known-limitations)
+17. [Future Work](#17-future-work)
 
 ---
 
@@ -63,7 +65,7 @@ Build the server:
 cargo build --release
 ```
 
-Start with the defaults (`127.0.0.1:6379`, `multi` mode, `everysec` AOF syncing):
+Start with the defaults (`0.0.0.0:6379`, `multi` mode, `everysec` AOF syncing):
 
 ```
 cargo run --release
@@ -79,10 +81,10 @@ cargo run --release -- --host 127.0.0.1 --port 6380 --mode single --appendfsync 
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--host HOST` | `127.0.0.1` | Interface/address to bind |
+| `--host HOST` | `0.0.0.0` | Interface/address to bind |
 | `--port PORT` | `6379` | TCP port (`0`–`65535`) |
-| \`--mode single | multi\` | `multi` |
-| \`--appendfsync always | everysec | no\` |
+| `--mode MODE` | `multi` | Execution mode: `single` or `multi` |
+| `--appendfsync POLICY` | `everysec` | AOF sync policy: `always`, `everysec`, or `no` |
 | `--help`, `-h` | — | Print usage and exit |
 
 The server reads and writes `appendonly.aof` in its **current working directory**. Use a dedicated working directory if you want to isolate its data file.
@@ -103,12 +105,100 @@ OK
 (integer) 59
 ```
 
-## 3\. Project Layout
+
+## 3. Docker
+
+The Docker image can be built and run locally. The image has **not yet been published to a container registry**, so these instructions use a local image.
+
+### Build the image
+
+From the repository root (the directory containing `Cargo.toml`, `Dockerfile`, and `.dockerignore`):
+
+```bash
+docker build -t rust-redis:0.1.0 .
+```
+
+### Run the container
+
+```bash
+docker run -d --name rust-redis -p 6379:6379 rust-redis:0.1.0
+```
+
+Check the container and its logs:
+
+```bash
+docker ps
+docker logs -f rust-redis
+```
+
+Connect to the server at `127.0.0.1:6379` using a RESP2-compatible client, such as `redis-cli -2` or `redis-py`.
+
+To stop and remove the container:
+
+```bash
+docker stop rust-redis
+docker rm rust-redis
+```
+
+### Persistence in Docker
+
+The server writes `appendonly.aof` in its **current working directory**. Check the `WORKDIR` in the Dockerfile and make sure that directory is mounted as a volume if you want the AOF file to survive container replacement. For example, if the image writes the AOF file to `/data`, use:
+
+```bash
+docker volume create rust-redis-data
+docker run -d --name rust-redis \
+  -p 6379:6379 \
+  -v rust-redis-data:/data \
+  rust-redis:0.1.0
+```
+
+The `/data` example only preserves AOF data if the server's working directory/AOF location inside the container is actually `/data`. A volume mount alone does not change the application's AOF path.
+
+The server defaults to binding `0.0.0.0:6379` inside the container. Docker port publishing (`-p 6379:6379`) makes the port available on the host. Do not expose this learning implementation to untrusted networks: authentication and TLS are not implemented.
+
+When a public image is published, replace the local `docker build` step with `docker pull <registry-username>/rust-redis:<version>` and use that image name in `docker run`.
+
+---
+
+## 4. Install from GitHub Releases
+
+Precompiled executables can be distributed as assets attached to GitHub Releases. Download the asset matching your operating system and CPU architecture from the repository's **Releases** page. A Windows executable cannot run natively on Linux or macOS, so each platform needs its own build.
+
+### Windows
+
+1. Download the Windows x86-64 executable from the release assets.
+2. Open PowerShell in the directory containing the downloaded file.
+3. Run it, replacing the filename if the release uses a different name:
+
+```powershell
+.\rust-redis-windows-x86_64.exe
+```
+
+### Linux
+
+1. Download the Linux x86-64 executable.
+2. Open a terminal in the directory containing the file.
+3. Make it executable and run it:
+
+```bash
+chmod +x rust-redis-linux-x86_64
+./rust-redis-linux-x86_64
+```
+
+The executable starts the server using its default configuration (`0.0.0.0:6379`, `multi` mode, and `everysec` AOF syncing). Use `--help` to see supported command-line options. The AOF file is created in the process's current working directory, so start the server from a directory where you want that file to live.
+
+These instructions apply once the corresponding precompiled executable has been attached to a GitHub Release. If an asset for your platform is not available, build from source using the instructions in [Quick Start](#2-quick-start).
+
+---
+
+## 5. Project Layout
 
 ```
 .
 ├── Cargo.toml
 ├── README.md
+├── Dockerfile
+├── .dockerignore
 ├── test.py              # Single-file end-to-end suite (builds and launches the server)
 └── src
     ├── main.rs          # CLI parsing, runtime selection, AOF replay, server start
@@ -123,7 +213,7 @@ OK
 
 ---
 
-## 4\. Architecture
+## 6. Architecture
 
 ### 4.1 High-level view
 
@@ -166,7 +256,7 @@ OK
 
 ---
 
-## 5\. Request Lifecycle
+## 7. Request Lifecycle
 
 ### 5.1 Startup
 
@@ -211,7 +301,7 @@ Because the inner loop keeps parsing until the buffer yields `Incomplete`, **pip
 
 ---
 
-## 6\. Module Reference
+## 8. Module Reference
 
 ### 6.1 `main.rs`
 
@@ -224,7 +314,7 @@ Parses `--host`, `--port`, `--mode`, and `--appendfsync` (plus help flags). Sele
 *   Owns the accept loop and a `JoinSet` of connection tasks.
 *   In `single` mode creates a global `Arc<Mutex<()>>` command lock shared by all handlers.
 *   Spawns the TTL cleanup task (1-second interval) that calls `db.remove_expired()`.
-*   On Ctrl+C: stops accepting, broadcasts shutdown through a `watch` channel, aborts the sweeper, and waits for every connection task. See [Graceful Shutdown](#12-graceful-shutdown).
+*   On Ctrl+C: stops accepting, broadcasts shutdown through a `watch` channel, aborts the sweeper, and waits for every connection task. See [Graceful Shutdown](#14-graceful-shutdown).
 
 ### 6.3 `handler.rs`
 
@@ -287,7 +377,7 @@ pub struct SharedDb(pub Arc<Db>);
 
 ---
 
-## 7\. Supported Commands
+## 9. Supported Commands
 
 Command names are case-insensitive. This is a Redis-inspired subset, not full Redis compatibility.
 
@@ -295,7 +385,7 @@ Command names are case-insensitive. This is a Redis-inspired subset, not full Re
 | --- | --- |
 | Connection | `HELLO`, `PING [message]` |
 | Keys and expiry | `EXISTS`, `DEL`, `KEYS pattern`, `SCAN cursor [MATCH pattern] [COUNT count]`, `TYPE`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `FLUSHALL`, `BGREWRITEAOF` |
-| Strings and counters | \`SET key value \[EX seconds |
+| Strings and counters | `SET key value [EX seconds \| PX milliseconds] [NX \| XX]`, `SETNX`, `GET`, `MSET`, `MGET`, `INCR`, `DECR`, `INCRBY`, `DECRBY` |
 | Hashes | `HSET` (multiple field/value pairs), `HGET`, `HGETALL`, `HDEL` (multiple fields), `HKEYS` |
 | Lists | `LPUSH`, `RPUSH` (multiple values), `LPOP`, `RPOP`, `LRANGE`, `LLEN` |
 | Sets | `SADD`, `SREM` (multiple members), `SMEMBERS`, `SISMEMBER`, `SINTER`, `SUNION` |
@@ -317,7 +407,7 @@ Invalid command arguments generally return an error without closing the connecti
 
 ---
 
-## 8\. Concurrency and Atomicity
+## 10. Concurrency and Atomicity
 
 ### 8.1 Execution modes
 
@@ -346,7 +436,7 @@ The store uses two lock levels:
 
 ---
 
-## 9\. Key Expiry (TTL)
+## 11. Key Expiry (TTL)
 
 Expiry uses two mechanisms:
 
@@ -363,7 +453,7 @@ Commands:
 
 ---
 
-## 10\. Persistence (AOF)
+## 12. Persistence (AOF)
 
 ### 10.1 Writing
 
@@ -411,7 +501,7 @@ Caveats:
 
 ---
 
-## 11\. Pub/Sub
+## 13. Pub/Sub
 
 *   `PUBLISH channel message` delivers to direct subscribers and to every matching pattern subscriber, and returns the total number of receivers.
 *   `SUBSCRIBE ch [ch ...]` and `PSUBSCRIBE pattern [pattern ...]` reply with one confirmation array per argument: `["subscribe" | "psubscribe", name, count]`. The count is the connection's total of channel plus pattern subscriptions.
@@ -424,7 +514,7 @@ Cleanup: unsubscribing, disconnecting, or shutting down aborts the forwarding ta
 
 ---
 
-## 12\. Graceful Shutdown
+## 14. Graceful Shutdown
 
 On Ctrl+C (SIGINT):
 
@@ -435,7 +525,7 @@ On Ctrl+C (SIGINT):
 
 ---
 
-## 13\. Testing
+## 15. Testing
 
 `test.py` is a single, ordered end-to-end suite. It builds the Rust server once per script run, starts it in a temporary directory (so the project's normal `appendonly.aof` is not touched), and runs integration and AOF persistence/recovery tests for each selected execution mode. The current suite does not run a graceful-shutdown test.
 
@@ -472,7 +562,7 @@ Helper functions `encode_command`, `read_line`, and `read_resp` implement a mini
 
 ---
 
-## 14\. Known Limitations
+## 16. Known Limitations
 
 This is a learning/portfolio implementation. It implements a subset of Redis behaviour and is not a drop-in replacement for production Redis.
 
@@ -507,7 +597,7 @@ This is a learning/portfolio implementation. It implements a subset of Redis beh
 
 ---
 
-## 15\. Future Work
+## 17. Future Work
 
 *   Expand command compatibility and close remaining semantic gaps with Redis.
 *   Make wrong-type errors and integer-overflow handling consistent across all commands.
