@@ -489,6 +489,9 @@ impl Handler {
             }
             Commands::Type { key } => RespSerializer::simple_string(self.db.type_of(&key).await),
             Commands::BgRewriteAof => {
+                if !self.aof.is_enabled() {
+                    return RespSerializer::error("AOF is disabled");
+                }
                 let aof = self.aof.clone();
                 let db = self.db.clone();
 

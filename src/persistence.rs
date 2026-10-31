@@ -25,6 +25,7 @@ pub struct Aof {
     path: Arc<String>,
     policy: FsyncPolicy,
     dirty: Arc<AtomicBool>,
+    enabled: bool,
     // Writers hold read; rewrite holds write. Keeps "execute + append" atomic
     // with respect to the snapshot taken by a rewrite.
     rewrite_gate: Arc<RwLock<()>>,
@@ -43,11 +44,12 @@ impl Aof {
             path: Arc::new(path.to_string()),
             policy,
             dirty: Arc::new(AtomicBool::new(false)),
+            enabled: true,
             rewrite_gate: Arc::new(RwLock::new(())),
         };
 
         if policy == FsyncPolicy::EverySec {
-            let file = aof.file.clone();
+            let file = aof.file.as_ref().unwrap().clone();
             let dirty = aof.dirty.clone();
 
             tokio::spawn(async move {
@@ -71,6 +73,10 @@ impl Aof {
     }
 
     pub async fn append(&self, command: &[u8]) -> io::Result<()> {
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+
         let mut file = self.file.lock().await;
 
         file.write_all(command).await?;
@@ -87,6 +93,10 @@ impl Aof {
 
     // Final flush to disk (call on shutdown).
     pub async fn sync(&self) -> io::Result<()> {
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+
         let file = self.file.lock().await;
         file.sync_all().await
     }
@@ -98,6 +108,9 @@ impl Aof {
 
     // Compaction: replace the log with the minimal commands that rebuild the DB.
     pub async fn rewrite(&self, db: &SharedDb) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         // Wait for in-flight writers, block new ones until the swap is done.
         let _stop_writers = self.rewrite_gate.write().await;
 
@@ -117,7 +130,11 @@ impl Aof {
             tmp.sync_all().await?;
         }
 
-        let mut file = self.file.lock().await;
+        let file_handle = self.file.as_ref().ok_or_else(|| {
+            io::Error::other("AOF is disabled");
+        })?;
+
+        let mut file = file_handle.lock().await;
 
         fs::rename(&tmp_path, self.path.as_str()).await?;
 
@@ -197,6 +214,21 @@ impl Aof {
         println!("[AOF] Replayed {} commands", replayed);
 
         Ok(replayed)
+    }
+
+    pub fn disabled(path: &str, policy: FsyncPolicy) -> Self {
+        Self {
+            file: None,
+            path: Arc::new(path.to_string()),
+            policy,
+            dirty: Arc::new(AtomicBool::new(false)),
+            enabled: false,
+            rewrite_gate: Arc::new(RwLock::new()),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 }
 

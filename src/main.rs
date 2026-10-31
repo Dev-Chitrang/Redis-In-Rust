@@ -17,6 +17,7 @@ struct Config {
     port: u16,
     mode: ExecutionMode,
     fsync: FsyncPolicy,
+    aof_enabled: bool,
 }
 
 impl Config {
@@ -71,6 +72,16 @@ impl Config {
                     };
                 }
 
+                "--aof" => {
+                    let value = args.next().ok_or("--aof required on or off")?;
+
+                    aof_enabled = match value.to_lowercase().as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _=> return Err("Invalid AOF Option. Use on or off".to_string()),
+                    };
+                }
+
                 "--help" | "-h" => {
                     println!(
                         "Usage: redis-clone \
@@ -92,6 +103,7 @@ impl Config {
             port,
             mode,
             fsync,
+            aof_enabled,
         })
     }
 }
@@ -118,11 +130,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.block_on(async {
         let db = SharedDb::new();
 
-        // Restore the database before accepting client connections.
-        Aof::replay("appendonly.aof", &db).await?;
+        let aof = if config.aof_enabled {
+            println!("[AOF] Enabled");
 
-        // Open the file for new commands after recovery.
-        let aof = Aof::open("appendonly.aof", config.fsync).await?;
+            // Restore database from existing AOF.
+            let replayed = Aof::replay("appendonly.aof", &db).await;
+
+            println!("[AOF] Replayed {} commands", replayed);
+
+            Aof::open("appendonly.aof", config.fsync).await?
+        } else {
+            println!("[AOF] disabled");
+            Aof::disabled("appendonly.aof", config.fsync)
+        };
 
         let server = Server::new(&address, db, config.mode, aof).await?;
 
